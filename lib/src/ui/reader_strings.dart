@@ -1,0 +1,28 @@
+abstract final class ReaderStrings {
+  static const loading = '正在打开书籍…';
+  static const retry = '重新加载';
+  static const loadFailed = '暂时无法加载内容';
+  static const emptyChapter = '本章暂无正文';
+  static const previousChapter = '上一章';
+  static const nextChapter = '下一章';
+  static const catalog = '目录';
+  static const bookmarks = '书签';
+  static const theme = '主题';
+  static const settings = '设置';
+  static const back = '返回';
+  static const addBookmark = '添加书签';
+  static const removeBookmark = '删除书签';
+  static const noBookmarks = '还没有书签';
+  static const readingMode = '阅读方式';
+  static const horizontal = '左右翻页';
+  static const vertical = '上下滚动';
+  static const fontSize = '字号';
+  static const lineHeight = '行距';
+  static const pageMargin = '页边距';
+  static const brightness = '亮度';
+  static const keepScreenOn = '阅读时屏幕常亮';
+  static const day = '日间';
+  static const eyeCare = '护眼';
+  static const parchment = '羊皮纸';
+  static const night = '夜间';
+}
