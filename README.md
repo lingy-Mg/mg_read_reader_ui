@@ -6,8 +6,8 @@
 
 | 平台 | 状态 | 原生能力 |
 | --- | --- | --- |
-| Android | 优先支持 | `FLAG_KEEP_SCREEN_ON` |
-| Windows | 支持 | `SetThreadExecutionState` |
+| Android | 优先支持 | 常亮与可选沉浸阅读（默认关闭；系统边缘滑动可临时唤出栏） |
+| Windows | 支持 | `SetThreadExecutionState` 常亮；不接管宿主全屏 |
 
 iOS、macOS、Linux 和 Web 暂不属于承诺支持范围。
 
@@ -66,6 +66,12 @@ class AppReaderDataSource implements TextReaderDataSource {
 
 阅读器默认进入索引 `-1` 的书籍信息预览，不加载任何章节正文。`loadChapterAtIndex` 用于全书进度条随机定位章节，不会为了跳转顺序遍历所有目录页。
 
+阅读器默认进入索引 `-1` 的书籍信息预览，不加载任何章节正文。`loadChapterAtIndex` 用于全书进度条随机定位章节，不会为了跳转顺序遍历所有目录页。
+
+如需在阅读顶部展示来源并让用户在外部浏览器查看当前章节，可在
+`ReaderBookInfo.sourceName` 和 `TextChapterContent.chapterUrl` 中提供可选值。插件只接受
+HTTP/HTTPS 链接，并且仅在用户点击链接时打开外部浏览器。
+
 ### 状态接口
 
 宿主实现 `TextReaderStateStore`，负责保存：
@@ -98,7 +104,8 @@ await controller.showControls();
 - 目录分页、当前章高亮和进度跳转。
 - 语义书签的添加、跳转和删除。
 - 日间、护眼、羊皮纸、夜间主题。
-- 字体、字号、行距、页边距和阅读区域亮度。
+- 独立主题面板（四套配色）及多级设置：字体、排版、显示与翻页、设备能力。
+- 字体、字号、字重、字距、行距、段距、首行缩进、页边距和阅读区域亮度；旧持久化值会归一到最近预设。
 - Android 返回键及 Windows 键盘、鼠标交互。
 - 前后台生命周期通知、进度 flush 和引用计数常亮。
 - 最后一章继续前进时显示“没有下一章了”，不会停在空白边界页。
@@ -122,6 +129,20 @@ flutter run -d windows
 ```
 
 示例小说《山灯未眠》是项目内原创演示文本。
+
+## VS Code 任务按钮
+
+安装推荐的 `spencerwmiles.vscode-task-buttons` 扩展后，状态栏会提供：
+
+- `开发运行`：在 `example/` 中启动 Flutter 开发版本，并自动选择设备。
+- `发布 APK`：执行 Android Release 构建。
+- `发布 Windows EXE`：执行 Windows Release 构建。
+
+也可以直接按 `F5`，在 Flutter/Dart 调试配置中选择 `Example（选择设备）` 或
+`Example（Windows）`。发布任务不会使用 debug 构建，Android APK 固定为单一
+`arm64-v8a`（ARMv8）架构，Windows 固定为 `x64` 架构：APK 位于
+`build/novel_reader_ui_example-release.apk`；Windows 完整应用位于
+`build/novel_reader_ui_example-windows-release/`，任务会自动从 Flutter 的深层构建目录复制过去。需要将该目录整体作为 Windows 应用分发，不能只复制 EXE 文件。
 
 ## 验证
 

@@ -7,8 +7,11 @@
 #include "generated_plugin_registrant.h"
 
 #include <novel_reader_ui/novel_reader_ui_plugin_c_api.h>
+#include <url_launcher_windows/url_launcher_windows.h>
 
 void RegisterPlugins(flutter::PluginRegistry* registry) {
   NovelReaderUiPluginCApiRegisterWithRegistrar(
       registry->GetRegistrarForPlugin("NovelReaderUiPluginCApi"));
+  UrlLauncherWindowsRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("UrlLauncherWindows"));
 }

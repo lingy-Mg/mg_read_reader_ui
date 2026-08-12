@@ -36,14 +36,36 @@ NovelReaderUiPlugin::~NovelReaderUiPlugin() {
 void NovelReaderUiPlugin::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  if (method_call.method_name() != "setKeepScreenOn") {
+  if (method_call.method_name() == "getCapabilities") {
+    flutter::EncodableMap capabilities;
+    capabilities[flutter::EncodableValue("keepScreenOn")] = flutter::EncodableValue(true);
+    capabilities[flutter::EncodableValue("immersiveMode")] = flutter::EncodableValue(false);
+    result->Success(flutter::EncodableValue(capabilities));
+    return;
+  }
+  if (method_call.method_name() != "setReaderSystemUi") {
     result->NotImplemented();
     return;
   }
 
-  const auto* enabled = std::get_if<bool>(method_call.arguments());
+  const auto* arguments = std::get_if<flutter::EncodableMap>(method_call.arguments());
+  if (arguments == nullptr) {
+    result->Error("invalid_argument", "A settings map is required.");
+    return;
+  }
+  const auto found = arguments->find(flutter::EncodableValue("keepScreenOn"));
+  const auto* enabled =
+      found == arguments->end() ? nullptr : std::get_if<bool>(&found->second);
   if (enabled == nullptr) {
-    result->Error("invalid_argument", "A boolean value is required.");
+    result->Error("invalid_argument", "A keepScreenOn boolean is required.");
+    return;
+  }
+  const auto immersive_found = arguments->find(flutter::EncodableValue("immersiveMode"));
+  const auto* immersive = immersive_found == arguments->end()
+                             ? nullptr
+                             : std::get_if<bool>(&immersive_found->second);
+  if (immersive == nullptr) {
+    result->Error("invalid_argument", "An immersiveMode boolean is required.");
     return;
   }
 

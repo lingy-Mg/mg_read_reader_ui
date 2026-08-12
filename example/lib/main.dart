@@ -1,23 +1,129 @@
 import 'dart:async';
+import 'dart:ui' show FrameTiming;
 
 import 'package:flutter/material.dart';
 import 'package:novel_reader_ui/novel_reader_ui.dart';
 
 void main() => runApp(const ReaderExampleApp());
 
-class ReaderExampleApp extends StatelessWidget {
+class ReaderExampleApp extends StatefulWidget {
   const ReaderExampleApp({super.key});
+
+  @override
+  State<ReaderExampleApp> createState() => _ReaderExampleAppState();
+}
+
+class _ReaderExampleAppState extends State<ReaderExampleApp> {
+  bool _showGlobalPerformanceOverlay = false;
+
+  void _togglePerformanceOverlay() {
+    setState(() {
+      _showGlobalPerformanceOverlay = !_showGlobalPerformanceOverlay;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Novel Reader UI Example',
       debugShowCheckedModeBanner: false,
+      showPerformanceOverlay: _showGlobalPerformanceOverlay,
+      builder: (BuildContext context, Widget? child) {
+        return Stack(
+          children: <Widget>[
+            child ?? const SizedBox.shrink(),
+            _FrameRateOverlay(
+              showGlobalPerformanceOverlay: _showGlobalPerformanceOverlay,
+              onToggle: _togglePerformanceOverlay,
+            ),
+          ],
+        );
+      },
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFE7683F)),
+        fontFamily: 'packages/novel_reader_ui/MiSans',
         useMaterial3: true,
       ),
       home: const ReaderExampleHome(),
+    );
+  }
+}
+
+class _FrameRateOverlay extends StatefulWidget {
+  const _FrameRateOverlay({
+    required this.showGlobalPerformanceOverlay,
+    required this.onToggle,
+  });
+
+  final bool showGlobalPerformanceOverlay;
+  final VoidCallback onToggle;
+
+  @override
+  State<_FrameRateOverlay> createState() => _FrameRateOverlayState();
+}
+
+class _FrameRateOverlayState extends State<_FrameRateOverlay> {
+  static const Duration _refreshInterval = Duration(seconds: 1);
+
+  int _framesSinceLastRefresh = 0;
+  int _framesPerSecond = 0;
+  Timer? _refreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addTimingsCallback(_recordFrameTimings);
+    _refreshTimer = Timer.periodic(_refreshInterval, (_) {
+      if (!mounted) return;
+      setState(() {
+        _framesPerSecond = _framesSinceLastRefresh;
+        _framesSinceLastRefresh = 0;
+      });
+    });
+  }
+
+  void _recordFrameTimings(List<FrameTiming> timings) {
+    _framesSinceLastRefresh += timings.length;
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    WidgetsBinding.instance.removeTimingsCallback(_recordFrameTimings);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isGlobal = widget.showGlobalPerformanceOverlay;
+    return Positioned(
+      top: 12,
+      left: 12,
+      child: Semantics(
+        button: true,
+        label: isGlobal ? '全局性能监视，点击切换为小窗' : '小窗性能监视，点击切换为全局',
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: widget.onToggle,
+          child: DecoratedBox(
+            decoration: const BoxDecoration(
+              color: Color(0xB3000000),
+              borderRadius: BorderRadius.all(Radius.circular(8)),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              child: Text(
+                '$_framesPerSecond FPS · ${isGlobal ? '全局' : '小窗'}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -147,6 +253,7 @@ class DemoReaderDataSource implements TextReaderDataSource {
       title: '山灯未眠',
       author: '示例作者',
       description: '关于一座山城、一盏旧灯和一段归途的原创短篇。',
+      sourceName: '示例书源',
     );
   }
 
@@ -216,6 +323,8 @@ class DemoReaderDataSource implements TextReaderDataSource {
         chapterId: 'chapter-${chapterIndex + 1}',
         title: titles[chapterIndex],
         contentVersion: '1',
+        chapterUrl:
+            'https://example.com/mountain-lamp/chapter-${chapterIndex + 1}',
         paragraphs: List<TextParagraph>.generate(14, (int paragraphIndex) {
           final String variation = paragraphIndex.isEven
               ? '风从屋檐下掠过，带来潮湿泥土和松针的气息。'
