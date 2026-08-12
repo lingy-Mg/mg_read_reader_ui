@@ -80,7 +80,10 @@ Future<void> _pumpReader(
 
 class _GoldenPlatform extends ReaderPlatform with MockPlatformInterfaceMixin {
   @override
-  Future<void> setKeepScreenOn(bool enabled) async {}
+  Future<void> setReaderSystemUi({
+    required bool keepScreenOn,
+    required bool immersiveMode,
+  }) async {}
 }
 
 class _GoldenDataSource implements TextReaderDataSource {

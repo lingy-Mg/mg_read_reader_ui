@@ -1,16 +1,21 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:ui' show PointerDeviceKind;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../api/contracts.dart';
 import '../api/controller.dart';
 import '../api/models.dart';
 import '../pagination/text_paginator.dart';
 import '../platform/screen_awake_coordinator.dart';
+import '../platform/reader_platform.dart';
 import 'reader_strings.dart';
 import 'reader_theme.dart';
+
+enum _TopBarMenuAction { refresh, catalog, bookmarks, theme, settings }
 
 /// A complete, embeddable text reading surface.
 ///
@@ -41,6 +46,14 @@ class TextReaderView extends StatefulWidget {
 class _TextReaderViewState extends State<TextReaderView> {
   static const Duration _saveDelay = Duration(milliseconds: 800);
   static const int _chapterCacheLimit = 3;
+  static const double _pageFooterBottomInset = 10;
+  // TextPainter measures fractional line heights, while RenderParagraph rounds
+  // their painted extent to device pixels. Keep a small reserve so a page that
+  // exactly fits during pagination cannot overflow by a rounding pixel.
+  static const double _horizontalPageLayoutSafety = 2;
+  static const double _mouseTapSlop = 18;
+  // PointerEvent.buttons uses a bit mask; 1 denotes the primary mouse button.
+  static const int _primaryMouseButton = 1;
 
   final TextPaginator _paginator = const TextPaginator();
   final Object _awakeHolder = Object();
@@ -76,12 +89,22 @@ class _TextReaderViewState extends State<TextReaderView> {
   bool _controlsVisible = false;
   bool _foreground = true;
   bool _awakeAcquired = false;
+  ReaderPlatformCapabilities _platformCapabilities =
+      const ReaderPlatformCapabilities();
+  Future<void> _preferencesWrite = Future<void>.value();
   bool _changingChapter = false;
   bool _disposed = false;
+  int? _mouseTapPointer;
+  Offset? _mouseTapDownPosition;
+  bool _mouseTapMoved = false;
   double? _sliderPreview;
 
   ReaderObserver get _observer => widget.observer ?? const ReaderObserver();
   ReaderPalette get _palette => ReaderPalette.fromPreset(_preferences.theme);
+  TextScaler get _textScaler => MediaQuery.textScalerOf(
+    context,
+  ).clamp(minScaleFactor: .85, maxScaleFactor: 1.3);
+  String _indented(String text) => '${'　' * _preferences.firstLineIndent}$text';
   ReaderChapterInfo? get _currentChapter =>
       _catalog.isEmpty || _chapterIndex >= _catalog.length
       ? null
@@ -94,7 +117,21 @@ class _TextReaderViewState extends State<TextReaderView> {
     _bindController();
     _verticalController.addListener(_handleVerticalScroll);
     _lifecycleListener = AppLifecycleListener(onStateChange: _handleLifecycle);
+    unawaited(_loadPlatformCapabilities());
     unawaited(_initialize());
+  }
+
+  Future<void> _loadPlatformCapabilities() async {
+    try {
+      final ReaderPlatformCapabilities capabilities = await ReaderPlatform
+          .instance
+          .capabilities();
+      if (_disposed) return;
+      setState(() => _platformCapabilities = capabilities);
+      await _syncAwake();
+    } catch (error) {
+      await _reportFailure(_asFailure(error, ReaderFailureKind.platform));
+    }
   }
 
   @override
@@ -424,10 +461,14 @@ class _TextReaderViewState extends State<TextReaderView> {
     final EdgeInsets safe = MediaQuery.paddingOf(context);
     final double width =
         size.width - (_preferences.horizontalPadding * 2).clamp(24, size.width);
-    final double height = (size.height - safe.top - safe.bottom - 72).clamp(
-      80,
-      size.height,
-    );
+    final double height =
+        (size.height -
+                safe.top -
+                safe.bottom -
+                _preferences.topPadding -
+                _preferences.bottomPadding -
+                _horizontalPageLayoutSafety)
+            .clamp(80, size.height);
     final TextStyle bodyStyle = _bodyTextStyle;
     try {
       final List<ReaderPage> pages = _paginator.paginate(
@@ -437,7 +478,9 @@ class _TextReaderViewState extends State<TextReaderView> {
         titleStyle: _titleTextStyle,
         bodyStyle: bodyStyle,
         paragraphSpacing: _preferences.paragraphSpacing,
+        firstLineIndent: _preferences.firstLineIndent,
         textDirection: Directionality.of(context),
+        textScaler: _textScaler,
       );
       final ReaderProgress? anchor = _progress;
       final int pageIndex = anchor == null
@@ -468,15 +511,18 @@ class _TextReaderViewState extends State<TextReaderView> {
     color: _palette.text,
     fontFamily: readerFontFamily(_preferences.font),
     fontFamilyFallback: readerFontFallback(_preferences.font),
+    package: readerFontPackageFor(_preferences.font),
     fontSize: _preferences.fontSize,
+    fontWeight: FontWeight(_preferences.fontWeight),
     height: _preferences.lineHeight,
-    letterSpacing: 0.2,
+    letterSpacing: _preferences.letterSpacing,
   );
 
   TextStyle get _titleTextStyle => TextStyle(
     color: _palette.text,
     fontFamily: readerFontFamily(_preferences.font),
     fontFamilyFallback: readerFontFallback(_preferences.font),
+    package: readerFontPackageFor(_preferences.font),
     fontSize: _preferences.fontSize + 7,
     fontWeight: FontWeight.w700,
     height: 1.35,
@@ -519,6 +565,49 @@ class _TextReaderViewState extends State<TextReaderView> {
       await _animateToPage(_pageIndex - 1);
     } else {
       await _previousChapter();
+    }
+  }
+
+  void _handleHorizontalTap(Offset localPosition) {
+    final Size? size = context.size;
+    if (size == null || size.width <= 0) return;
+    final double fraction = localPosition.dx / size.width;
+    if (fraction < 0.3) {
+      unawaited(_previousPage());
+    } else if (fraction > 0.7) {
+      unawaited(_nextPage());
+    } else {
+      _setControlsVisible(!_controlsVisible);
+    }
+  }
+
+  void _trackMousePointerDown(PointerDownEvent event) {
+    if (event.kind != PointerDeviceKind.mouse ||
+        event.buttons != _primaryMouseButton) {
+      return;
+    }
+    _mouseTapPointer = event.pointer;
+    _mouseTapDownPosition = event.localPosition;
+    _mouseTapMoved = false;
+  }
+
+  void _trackMousePointerMove(PointerMoveEvent event) {
+    if (event.pointer != _mouseTapPointer || _mouseTapMoved) return;
+    final Offset? downPosition = _mouseTapDownPosition;
+    if (downPosition != null &&
+        (event.localPosition - downPosition).distance > _mouseTapSlop) {
+      _mouseTapMoved = true;
+    }
+  }
+
+  void _finishMousePointer(PointerEvent event) {
+    if (event.pointer != _mouseTapPointer) return;
+    final bool isTap = !_mouseTapMoved;
+    _mouseTapPointer = null;
+    _mouseTapDownPosition = null;
+    _mouseTapMoved = false;
+    if (isTap && event is PointerUpEvent) {
+      _handleHorizontalTap(event.localPosition);
     }
   }
 
@@ -657,16 +746,27 @@ class _TextReaderViewState extends State<TextReaderView> {
     final bool layoutChanged =
         normalized.font != _preferences.font ||
         normalized.fontSize != _preferences.fontSize ||
+        normalized.fontWeight != _preferences.fontWeight ||
+        normalized.letterSpacing != _preferences.letterSpacing ||
         normalized.lineHeight != _preferences.lineHeight ||
         normalized.paragraphSpacing != _preferences.paragraphSpacing ||
+        normalized.firstLineIndent != _preferences.firstLineIndent ||
         normalized.horizontalPadding != _preferences.horizontalPadding ||
+        normalized.topPadding != _preferences.topPadding ||
+        normalized.bottomPadding != _preferences.bottomPadding ||
         normalized.navigationMode != _preferences.navigationMode;
     setState(() {
       _preferences = normalized;
       if (layoutChanged) _layoutSize = null;
     });
+    // Capture this normalized value now: later taps must not turn this queued
+    // write into a duplicate write of a newer preference snapshot.
+    _preferencesWrite = _preferencesWrite.then(
+      (_) => widget.stateStore.savePreferences(normalized),
+      onError: (_) => widget.stateStore.savePreferences(normalized),
+    );
     try {
-      await widget.stateStore.savePreferences(normalized);
+      await _preferencesWrite;
     } catch (error) {
       await _reportFailure(_asFailure(error, ReaderFailureKind.persistence));
     }
@@ -706,11 +806,31 @@ class _TextReaderViewState extends State<TextReaderView> {
         !_disposed &&
         _foreground &&
         _content != null &&
-        _preferences.keepScreenOn;
+        ((_preferences.keepScreenOn && _platformCapabilities.keepScreenOn) ||
+            (_preferences.immersiveMode &&
+                _platformCapabilities.immersiveMode));
     if (shouldAcquire && !_awakeAcquired) {
       try {
-        await ScreenAwakeCoordinator.instance.acquire(_awakeHolder);
+        await ScreenAwakeCoordinator.instance.acquire(
+          _awakeHolder,
+          keepScreenOn:
+              _preferences.keepScreenOn && _platformCapabilities.keepScreenOn,
+          immersiveMode:
+              _preferences.immersiveMode && _platformCapabilities.immersiveMode,
+        );
         _awakeAcquired = true;
+      } catch (error) {
+        await _reportFailure(_asFailure(error, ReaderFailureKind.platform));
+      }
+    } else if (shouldAcquire) {
+      try {
+        await ScreenAwakeCoordinator.instance.acquire(
+          _awakeHolder,
+          keepScreenOn:
+              _preferences.keepScreenOn && _platformCapabilities.keepScreenOn,
+          immersiveMode:
+              _preferences.immersiveMode && _platformCapabilities.immersiveMode,
+        );
       } catch (error) {
         await _reportFailure(_asFailure(error, ReaderFailureKind.platform));
       }
@@ -774,58 +894,64 @@ class _TextReaderViewState extends State<TextReaderView> {
   @override
   Widget build(BuildContext context) {
     final ReaderPalette palette = _palette;
-    return AnnotatedRegion<SystemUiOverlayStyle>(
-      value: palette.systemBrightness == Brightness.dark
-          ? SystemUiOverlayStyle.light
-          : SystemUiOverlayStyle.dark,
-      child: PopScope<void>(
-        canPop: false,
-        onPopInvokedWithResult: (bool didPop, void result) {
-          if (!didPop) unawaited(_requestExit());
-        },
-        child: Material(
-          color: palette.background,
-          child: CallbackShortcuts(
-            bindings: <ShortcutActivator, VoidCallback>{
-              const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
-                  unawaited(_nextPage()),
-              const SingleActivator(LogicalKeyboardKey.pageDown): () =>
-                  unawaited(_nextPage()),
-              const SingleActivator(LogicalKeyboardKey.space): () =>
-                  unawaited(_nextPage()),
-              const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
-                  unawaited(_previousPage()),
-              const SingleActivator(LogicalKeyboardKey.pageUp): () =>
-                  unawaited(_previousPage()),
-              const SingleActivator(
-                LogicalKeyboardKey.space,
-                shift: true,
-              ): () =>
-                  unawaited(_previousPage()),
-              const SingleActivator(LogicalKeyboardKey.escape): () =>
-                  unawaited(_requestExit()),
-            },
-            child: Focus(
-              focusNode: _focusNode,
-              autofocus: true,
-              child: LayoutBuilder(
-                builder: (BuildContext context, BoxConstraints constraints) {
-                  _ensurePagination(constraints.biggest);
-                  return Stack(
-                    fit: StackFit.expand,
-                    children: <Widget>[
-                      _buildContent(),
-                      if (_content != null) _buildChrome(),
-                      IgnorePointer(
-                        child: ColoredBox(
-                          color: Colors.black.withValues(
-                            alpha: (1 - _preferences.brightness) * 0.65,
+    return DefaultTextStyle.merge(
+      style: const TextStyle(
+        fontFamily: readerDefaultFontFamily,
+        package: readerFontPackageName,
+      ),
+      child: AnnotatedRegion<SystemUiOverlayStyle>(
+        value: palette.systemBrightness == Brightness.dark
+            ? SystemUiOverlayStyle.light
+            : SystemUiOverlayStyle.dark,
+        child: PopScope<void>(
+          canPop: false,
+          onPopInvokedWithResult: (bool didPop, void result) {
+            if (!didPop) unawaited(_requestExit());
+          },
+          child: Material(
+            color: palette.background,
+            child: CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
+                    unawaited(_nextPage()),
+                const SingleActivator(LogicalKeyboardKey.pageDown): () =>
+                    unawaited(_nextPage()),
+                const SingleActivator(LogicalKeyboardKey.space): () =>
+                    unawaited(_nextPage()),
+                const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
+                    unawaited(_previousPage()),
+                const SingleActivator(LogicalKeyboardKey.pageUp): () =>
+                    unawaited(_previousPage()),
+                const SingleActivator(
+                  LogicalKeyboardKey.space,
+                  shift: true,
+                ): () =>
+                    unawaited(_previousPage()),
+                const SingleActivator(LogicalKeyboardKey.escape): () =>
+                    unawaited(_requestExit()),
+              },
+              child: Focus(
+                focusNode: _focusNode,
+                autofocus: true,
+                child: LayoutBuilder(
+                  builder: (BuildContext context, BoxConstraints constraints) {
+                    _ensurePagination(constraints.biggest);
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: <Widget>[
+                        _buildContent(),
+                        if (_content != null) _buildChrome(),
+                        IgnorePointer(
+                          child: ColoredBox(
+                            color: Colors.black.withValues(
+                              alpha: (1 - _preferences.brightness) * 0.65,
+                            ),
                           ),
                         ),
-                      ),
-                    ],
-                  );
-                },
+                      ],
+                    );
+                  },
+                ),
               ),
             ),
           ),
@@ -883,34 +1009,50 @@ class _TextReaderViewState extends State<TextReaderView> {
         ),
       );
     }
+    final ScrollBehavior horizontalPageScrollBehavior =
+        ScrollConfiguration.of(context).copyWith(
+          // Flutter excludes mouse drags from scrollables by default. This
+          // restores PageView's native, position-following drag behavior.
+          dragDevices: <PointerDeviceKind>{
+            ...ScrollConfiguration.of(context).dragDevices,
+            PointerDeviceKind.mouse,
+          },
+        );
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
-      onTapUp: (TapUpDetails details) {
-        final double fraction = details.localPosition.dx / context.size!.width;
-        if (fraction < 0.3) {
-          unawaited(_previousPage());
-        } else if (fraction > 0.7) {
-          unawaited(_nextPage());
-        } else {
-          _setControlsVisible(!_controlsVisible);
-        }
+      supportedDevices: const <PointerDeviceKind>{
+        PointerDeviceKind.touch,
+        PointerDeviceKind.stylus,
+        PointerDeviceKind.invertedStylus,
       },
-      child: PageView.builder(
-        controller: _pageController,
-        physics: _preferences.pageAnimation == ReaderPageAnimation.none
-            ? const NeverScrollableScrollPhysics()
-            : const PageScrollPhysics(),
-        itemCount: _pages.length + 2,
-        onPageChanged: _onHorizontalPageChanged,
-        itemBuilder: (BuildContext context, int index) {
-          if (index == 0) {
-            return _chapterBoundary(ReaderStrings.previousChapter);
-          }
-          if (index == _pages.length + 1) {
-            return _chapterBoundary(ReaderStrings.nextChapter);
-          }
-          return _buildPage(_pages[index - 1], index - 1);
-        },
+      onTapUp: (TapUpDetails details) =>
+          _handleHorizontalTap(details.localPosition),
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: _trackMousePointerDown,
+        onPointerMove: _trackMousePointerMove,
+        onPointerUp: _finishMousePointer,
+        onPointerCancel: _finishMousePointer,
+        child: ScrollConfiguration(
+          behavior: horizontalPageScrollBehavior,
+          child: PageView.builder(
+            controller: _pageController,
+            physics: _preferences.pageAnimation == ReaderPageAnimation.none
+                ? const NeverScrollableScrollPhysics()
+                : const PageScrollPhysics(),
+            itemCount: _pages.length + 2,
+            onPageChanged: _onHorizontalPageChanged,
+            itemBuilder: (BuildContext context, int index) {
+              if (index == 0) {
+                return _chapterBoundary(ReaderStrings.previousChapter);
+              }
+              if (index == _pages.length + 1) {
+                return _chapterBoundary(ReaderStrings.nextChapter);
+              }
+              return _buildPage(_pages[index - 1], index - 1);
+            },
+          ),
+        ),
       ),
     );
   }
@@ -925,30 +1067,34 @@ class _TextReaderViewState extends State<TextReaderView> {
 
   Widget _buildPage(ReaderPage page, int index) {
     return SafeArea(
-      child: Padding(
-        padding: EdgeInsets.fromLTRB(
-          _preferences.horizontalPadding,
-          22,
-          _preferences.horizontalPadding,
-          34,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            Expanded(
+      child: Stack(
+        children: <Widget>[
+          Positioned.fill(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(
+                _preferences.horizontalPadding,
+                _preferences.topPadding,
+                _preferences.horizontalPadding,
+                _preferences.bottomPadding,
+              ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: <Widget>[
                   if (page.showsTitle) ...<Widget>[
-                    Text(_content!.title, style: _titleTextStyle),
+                    Text(
+                      _content!.title,
+                      style: _titleTextStyle,
+                      textScaler: _textScaler,
+                    ),
                     const SizedBox(height: 28),
                   ],
                   for (final ReaderPageBlock block in page.blocks) ...<Widget>[
                     Text(
                       block.isParagraphStart
-                          ? '\u3000\u3000${block.text}'
+                          ? _indented(block.text)
                           : block.text,
                       style: _bodyTextStyle,
+                      textScaler: _textScaler,
                     ),
                     if (block.isParagraphEnd)
                       SizedBox(height: _preferences.paragraphSpacing),
@@ -956,27 +1102,38 @@ class _TextReaderViewState extends State<TextReaderView> {
                 ],
               ),
             ),
-            Row(
-              children: <Widget>[
-                Expanded(
-                  child: Text(
-                    _content!.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+          ),
+          Positioned(
+            key: const ValueKey<String>('reader-page-footer'),
+            left: _preferences.horizontalPadding,
+            right: _preferences.horizontalPadding,
+            bottom: _pageFooterBottomInset,
+            child: IgnorePointer(
+              child: Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Text(
+                      _content!.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: _palette.secondaryText,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+                  Text(
+                    '${index + 1} / ${_pages.length}',
                     style: TextStyle(
                       color: _palette.secondaryText,
                       fontSize: 11,
                     ),
                   ),
-                ),
-                Text(
-                  '${index + 1} / ${_pages.length}',
-                  style: TextStyle(color: _palette.secondaryText, fontSize: 11),
-                ),
-              ],
+                ],
+              ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -991,16 +1148,20 @@ class _TextReaderViewState extends State<TextReaderView> {
           controller: _verticalController,
           padding: EdgeInsets.fromLTRB(
             _preferences.horizontalPadding,
-            28,
+            _preferences.topPadding,
             _preferences.horizontalPadding,
-            40,
+            _preferences.bottomPadding,
           ),
           itemCount: paragraphs.length + 2,
           itemBuilder: (BuildContext context, int index) {
             if (index == 0) {
               return Padding(
                 padding: const EdgeInsets.only(bottom: 28),
-                child: Text(_content!.title, style: _titleTextStyle),
+                child: Text(
+                  _content!.title,
+                  style: _titleTextStyle,
+                  textScaler: _textScaler,
+                ),
               );
             }
             if (index == paragraphs.length + 1) {
@@ -1021,8 +1182,9 @@ class _TextReaderViewState extends State<TextReaderView> {
               key: key,
               padding: EdgeInsets.only(bottom: _preferences.paragraphSpacing),
               child: Text(
-                '\u3000\u3000${paragraph.text}',
+                _indented(paragraph.text),
                 style: _bodyTextStyle,
+                textScaler: _textScaler,
               ),
             );
           },
@@ -1039,7 +1201,13 @@ class _TextReaderViewState extends State<TextReaderView> {
         duration: const Duration(milliseconds: 180),
         child: Stack(
           children: <Widget>[
-            Align(alignment: Alignment.topCenter, child: _buildTopBar()),
+            Align(
+              alignment: Alignment.topCenter,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[_buildTopBar(), _buildSourceInfoBar()],
+              ),
+            ),
             Align(alignment: Alignment.bottomCenter, child: _buildBottomBar()),
           ],
         ),
@@ -1097,11 +1265,232 @@ class _TextReaderViewState extends State<TextReaderView> {
                   color: _isCurrentBookmarked ? _palette.accent : null,
                 ),
               ),
+              IconButton(
+                tooltip: ReaderStrings.refreshChapter,
+                onPressed: _content == null
+                    ? null
+                    : () => unawaited(_refreshCurrentChapter()),
+                icon: const Icon(Icons.refresh_rounded),
+              ),
+              PopupMenuButton<_TopBarMenuAction>(
+                tooltip: ReaderStrings.more,
+                icon: const Icon(Icons.more_vert_rounded),
+                color: _palette.panel,
+                elevation: 12,
+                constraints: const BoxConstraints(minWidth: 208),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                onSelected: _handleTopBarMenuAction,
+                itemBuilder: (BuildContext context) =>
+                    <PopupMenuEntry<_TopBarMenuAction>>[
+                      _topBarMenuItem(
+                        _TopBarMenuAction.refresh,
+                        Icons.refresh_rounded,
+                        ReaderStrings.refreshChapter,
+                      ),
+                      const PopupMenuDivider(),
+                      _topBarMenuItem(
+                        _TopBarMenuAction.catalog,
+                        Icons.list_alt_rounded,
+                        ReaderStrings.catalog,
+                      ),
+                      _topBarMenuItem(
+                        _TopBarMenuAction.bookmarks,
+                        Icons.bookmarks_outlined,
+                        ReaderStrings.bookmarks,
+                      ),
+                      _topBarMenuItem(
+                        _TopBarMenuAction.theme,
+                        Icons.tonality_rounded,
+                        ReaderStrings.theme,
+                      ),
+                      _topBarMenuItem(
+                        _TopBarMenuAction.settings,
+                        Icons.text_fields_rounded,
+                        ReaderStrings.settings,
+                      ),
+                    ],
+              ),
             ],
           ),
         ),
       ),
     );
+  }
+
+  Widget _buildSourceInfoBar() {
+    final String sourceName = _sourceDisplayName;
+    final String? chapterUrl = _currentChapterUrl;
+    final Uri? chapterUri = _currentChapterUri;
+    final Widget chapterUrlLabel = Row(
+      children: <Widget>[
+        Icon(
+          Icons.open_in_new_rounded,
+          size: 16,
+          color: chapterUri == null ? _palette.secondaryText : _palette.accent,
+        ),
+        const SizedBox(width: 5),
+        Expanded(
+          child: Text(
+            chapterUrl ?? ReaderStrings.chapterUrlUnavailable,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: chapterUri == null
+                  ? _palette.secondaryText
+                  : _palette.text,
+              fontSize: 12,
+              decoration: chapterUri == null ? null : TextDecoration.underline,
+              decorationColor: _palette.accent,
+            ),
+          ),
+        ),
+      ],
+    );
+
+    final Widget chapterUrlAction = chapterUri == null
+        ? chapterUrlLabel
+        : Tooltip(
+            message: chapterUrl!,
+            child: Semantics(
+              button: true,
+              link: true,
+              label: '${ReaderStrings.openChapterUrl}: $chapterUrl',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: () => unawaited(_openCurrentChapterUrl()),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 5),
+                  child: chapterUrlLabel,
+                ),
+              ),
+            ),
+          );
+
+    return Material(
+      color: _palette.panel.withValues(alpha: 0.78),
+      child: Container(
+        height: 40,
+        width: double.infinity,
+        decoration: BoxDecoration(
+          border: Border(top: BorderSide(color: _palette.divider)),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: Row(
+          children: <Widget>[
+            Icon(Icons.cloud_outlined, size: 16, color: _palette.secondaryText),
+            const SizedBox(width: 5),
+            Expanded(
+              flex: 2,
+              child: Text(
+                '${ReaderStrings.source}: $sourceName',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: _palette.secondaryText, fontSize: 12),
+              ),
+            ),
+            Container(width: 1, height: 16, color: _palette.divider),
+            const SizedBox(width: 10),
+            Expanded(
+              flex: 3,
+              child: Semantics(
+                label: ReaderStrings.chapterUrl,
+                child: chapterUrlAction,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  PopupMenuItem<_TopBarMenuAction> _topBarMenuItem(
+    _TopBarMenuAction action,
+    IconData icon,
+    String label,
+  ) {
+    return PopupMenuItem<_TopBarMenuAction>(
+      value: action,
+      height: 44,
+      child: Row(
+        children: <Widget>[
+          Icon(icon, size: 20, color: _palette.secondaryText),
+          const SizedBox(width: 12),
+          Text(label, style: TextStyle(color: _palette.text)),
+        ],
+      ),
+    );
+  }
+
+  void _handleTopBarMenuAction(_TopBarMenuAction action) {
+    switch (action) {
+      case _TopBarMenuAction.refresh:
+        unawaited(_refreshCurrentChapter());
+        break;
+      case _TopBarMenuAction.catalog:
+        _showLibrarySheet();
+        break;
+      case _TopBarMenuAction.bookmarks:
+        _showLibrarySheet(initialIndex: 1);
+        break;
+      case _TopBarMenuAction.theme:
+      case _TopBarMenuAction.settings:
+        _showSettingsSheet();
+        break;
+    }
+  }
+
+  Future<void> _refreshCurrentChapter() async {
+    final String? chapterId = _content?.chapterId;
+    if (chapterId == null) return;
+    await _openChapter(chapterId, forceRefresh: true);
+  }
+
+  String get _sourceDisplayName {
+    final String? sourceName = _book?.sourceName?.trim();
+    return sourceName == null || sourceName.isEmpty
+        ? ReaderStrings.sourceUnavailable
+        : sourceName;
+  }
+
+  String? get _currentChapterUrl {
+    final String? chapterUrl = _content?.chapterUrl?.trim();
+    return chapterUrl == null || chapterUrl.isEmpty ? null : chapterUrl;
+  }
+
+  Uri? get _currentChapterUri {
+    final String? chapterUrl = _currentChapterUrl;
+    final Uri? uri = chapterUrl == null ? null : Uri.tryParse(chapterUrl);
+    if (uri == null || uri.host.isEmpty) return null;
+    return switch (uri.scheme) {
+      'http' || 'https' => uri,
+      _ => null,
+    };
+  }
+
+  Future<void> _openCurrentChapterUrl() async {
+    final Uri? uri = _currentChapterUri;
+    if (uri == null) {
+      await _reportFailure(
+        const ReaderFailure(
+          ReaderFailureKind.platform,
+          ReaderStrings.chapterUrlInvalid,
+        ),
+      );
+      return;
+    }
+    try {
+      final bool launched = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
+      if (!launched) {
+        throw StateError(ReaderStrings.chapterUrlOpenFailed);
+      }
+    } catch (error) {
+      await _reportFailure(_asFailure(error, ReaderFailureKind.platform));
+    }
   }
 
   Widget _buildBottomBar() {
@@ -1152,7 +1541,7 @@ class _TextReaderViewState extends State<TextReaderView> {
                   _barAction(
                     Icons.tonality_rounded,
                     ReaderStrings.theme,
-                    _showSettingsSheet,
+                    _showThemeSheet,
                   ),
                   _barAction(
                     Icons.text_fields_rounded,
@@ -1388,185 +1777,475 @@ class _TextReaderViewState extends State<TextReaderView> {
       isScrollControlled: true,
       backgroundColor: _palette.panel,
       builder: (BuildContext context) {
-        return StatefulBuilder(
-          builder: (BuildContext context, StateSetter setSheetState) {
-            void update(TextReaderPreferences value) {
-              unawaited(_updatePreferences(value));
-              setSheetState(() {});
-            }
-
-            return SafeArea(
-              top: false,
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    const Text(
-                      ReaderStrings.theme,
-                      style: TextStyle(fontWeight: FontWeight.w700),
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: ReaderThemePreset.values.map((preset) {
-                        final ReaderPalette itemPalette =
-                            ReaderPalette.fromPreset(preset);
-                        final String label = switch (preset) {
-                          ReaderThemePreset.day => ReaderStrings.day,
-                          ReaderThemePreset.eyeCare => ReaderStrings.eyeCare,
-                          ReaderThemePreset.parchment =>
-                            ReaderStrings.parchment,
-                          ReaderThemePreset.night => ReaderStrings.night,
-                        };
-                        return Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.only(right: 8),
-                            child: InkWell(
-                              onTap: () =>
-                                  update(_preferences.copyWith(theme: preset)),
-                              borderRadius: BorderRadius.circular(12),
-                              child: Container(
-                                height: 52,
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  color: itemPalette.background,
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(
-                                    color: _preferences.theme == preset
-                                        ? _palette.accent
-                                        : itemPalette.divider,
-                                    width: _preferences.theme == preset ? 2 : 1,
-                                  ),
-                                ),
-                                child: Text(
-                                  label,
-                                  style: TextStyle(
-                                    color: itemPalette.text,
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                    const SizedBox(height: 22),
-                    _settingSlider(
-                      ReaderStrings.fontSize,
-                      _preferences.fontSize,
-                      14,
-                      32,
-                      (value) => update(_preferences.copyWith(fontSize: value)),
-                    ),
-                    _settingSlider(
-                      ReaderStrings.lineHeight,
-                      _preferences.lineHeight,
-                      1.3,
-                      2.4,
-                      (value) =>
-                          update(_preferences.copyWith(lineHeight: value)),
-                    ),
-                    _settingSlider(
-                      ReaderStrings.pageMargin,
-                      _preferences.horizontalPadding,
-                      12,
-                      64,
-                      (value) => update(
-                        _preferences.copyWith(horizontalPadding: value),
-                      ),
-                    ),
-                    _settingSlider(
-                      ReaderStrings.brightness,
-                      _preferences.brightness,
-                      0.25,
-                      1,
-                      (value) =>
-                          update(_preferences.copyWith(brightness: value)),
-                    ),
-                    const SizedBox(height: 12),
-                    SegmentedButton<ReaderFontPreset>(
-                      segments: const <ButtonSegment<ReaderFontPreset>>[
-                        ButtonSegment(
-                          value: ReaderFontPreset.system,
-                          label: Text('默认'),
-                        ),
-                        ButtonSegment(
-                          value: ReaderFontPreset.sansSerif,
-                          label: Text('黑体'),
-                        ),
-                        ButtonSegment(
-                          value: ReaderFontPreset.serif,
-                          label: Text('宋体'),
-                        ),
-                      ],
-                      selected: <ReaderFontPreset>{_preferences.font},
-                      onSelectionChanged: (value) =>
-                          update(_preferences.copyWith(font: value.first)),
-                    ),
-                    const SizedBox(height: 12),
-                    SegmentedButton<ReaderNavigationMode>(
-                      segments: const <ButtonSegment<ReaderNavigationMode>>[
-                        ButtonSegment(
-                          value: ReaderNavigationMode.horizontalPages,
-                          label: Text(ReaderStrings.horizontal),
-                          icon: Icon(Icons.view_carousel_outlined),
-                        ),
-                        ButtonSegment(
-                          value: ReaderNavigationMode.verticalScroll,
-                          label: Text(ReaderStrings.vertical),
-                          icon: Icon(Icons.swap_vert_rounded),
-                        ),
-                      ],
-                      selected: <ReaderNavigationMode>{
-                        _preferences.navigationMode,
-                      },
-                      onSelectionChanged: (value) => update(
-                        _preferences.copyWith(navigationMode: value.first),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text(ReaderStrings.keepScreenOn),
-                      value: _preferences.keepScreenOn,
-                      onChanged: (value) =>
-                          update(_preferences.copyWith(keepScreenOn: value)),
-                    ),
-                  ],
+        return SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const ListTile(
+                title: Text(
+                  ReaderStrings.readerSettings,
+                  style: TextStyle(fontWeight: FontWeight.w700),
                 ),
               ),
-            );
-          },
+              ListTile(
+                leading: const Icon(Icons.text_fields_rounded),
+                title: const Text(ReaderStrings.typography),
+                subtitle: const Text(ReaderStrings.fontOptions),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: _showTypographySheet,
+              ),
+              ListTile(
+                leading: const Icon(Icons.format_line_spacing_rounded),
+                title: const Text(ReaderStrings.layout),
+                subtitle: const Text(ReaderStrings.layoutOptions),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: _showLayoutSheet,
+              ),
+              ListTile(
+                leading: const Icon(Icons.visibility_outlined),
+                title: const Text(ReaderStrings.displayAndPaging),
+                subtitle: const Text(ReaderStrings.displayOptions),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: _showDisplaySheet,
+              ),
+              if (_platformCapabilities.keepScreenOn ||
+                  _platformCapabilities.immersiveMode)
+                ListTile(
+                  leading: const Icon(Icons.devices_outlined),
+                  title: const Text(ReaderStrings.deviceCapabilities),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _showDeviceSheet,
+                ),
+            ],
+          ),
         );
       },
     );
   }
 
-  Widget _settingSlider(
-    String label,
-    double value,
-    double min,
-    double max,
-    ValueChanged<double> onChanged,
-  ) {
-    return Row(
-      children: <Widget>[
-        SizedBox(width: 54, child: Text(label)),
-        Expanded(
-          child: Slider(
-            value: value.clamp(min, max),
-            min: min,
-            max: max,
-            onChanged: onChanged,
-          ),
-        ),
-        SizedBox(
-          width: 42,
-          child: Text(value.toStringAsFixed(1), textAlign: TextAlign.end),
-        ),
-      ],
+  void _showThemeSheet() => _showChoiceSheet(
+    ReaderStrings.themeTitle,
+    ReaderThemePreset.values,
+    _preferences.theme,
+    (ReaderThemePreset v) =>
+        _updatePreferences(_preferences.copyWith(theme: v)),
+    (ReaderThemePreset v) => switch (v) {
+      ReaderThemePreset.day => ReaderStrings.day,
+      ReaderThemePreset.eyeCare => ReaderStrings.eyeCare,
+      ReaderThemePreset.parchment => ReaderStrings.parchment,
+      ReaderThemePreset.night => ReaderStrings.night,
+    },
+  );
+  void _showTypographySheet() {
+    TextReaderPreferences sheetPreferences = _preferences;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _palette.panel,
+      builder: (BuildContext c) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setSheetState) {
+          void update(TextReaderPreferences next) {
+            final TextReaderPreferences normalized = next.normalized();
+            setSheetState(() => sheetPreferences = normalized);
+            unawaited(_updatePreferences(normalized));
+          }
+
+          return SafeArea(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  const ListTile(title: Text(ReaderStrings.typography)),
+                  ...ReaderFontPreset.values.map(
+                    (ReaderFontPreset v) => ListTile(
+                      selected: v == sheetPreferences.font,
+                      title: Text(
+                        v == ReaderFontPreset.system
+                            ? ReaderStrings.miSans
+                            : v == ReaderFontPreset.serif
+                            ? ReaderStrings.serif
+                            : ReaderStrings.sansSerif,
+                      ),
+                      trailing: v == sheetPreferences.font
+                          ? const Icon(Icons.check)
+                          : null,
+                      onTap: () => update(sheetPreferences.copyWith(font: v)),
+                    ),
+                  ),
+                  _choiceChips(
+                    ReaderStrings.fontSize,
+                    <num>[16, 19, 22, 26, 32],
+                    sheetPreferences.fontSize,
+                    (num v) =>
+                        sheetPreferences.copyWith(fontSize: v.toDouble()),
+                    update,
+                  ),
+                  _choiceChips(
+                    ReaderStrings.fontWeight,
+                    <num>[400, 500, 600],
+                    sheetPreferences.fontWeight,
+                    (num v) => sheetPreferences.copyWith(fontWeight: v.toInt()),
+                    update,
+                  ),
+                  _choiceChips(
+                    ReaderStrings.letterSpacing,
+                    <num>[0, .2, .8],
+                    sheetPreferences.letterSpacing,
+                    (num v) =>
+                        sheetPreferences.copyWith(letterSpacing: v.toDouble()),
+                    update,
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
     );
+  }
+
+  void _showLayoutSheet() =>
+      _showNumberSheet(ReaderStrings.layout, <String, List<num>>{
+        ReaderStrings.lineHeight: <num>[1.5, 1.8, 2.1],
+        ReaderStrings.paragraphSpacing: <num>[8, 14, 22],
+        ReaderStrings.firstLineIndent: <num>[0, 1, 2],
+        ReaderStrings.pageMargin: <num>[16, 24, 40],
+        ReaderStrings.topMargin: <num>[8, 24, 40, 64],
+        ReaderStrings.bottomMargin: <num>[8, 24, 40, 64],
+      });
+  void _showDisplaySheet() {
+    TextReaderPreferences sheetPreferences = _preferences;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _palette.panel,
+      builder: (BuildContext c) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setSheetState) {
+          void update(TextReaderPreferences next) {
+            final TextReaderPreferences normalized = next.normalized();
+            setSheetState(() => sheetPreferences = normalized);
+            unawaited(_updatePreferences(normalized));
+          }
+
+          return SafeArea(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  const ListTile(title: Text(ReaderStrings.displayAndPaging)),
+                  _choiceChips(
+                    ReaderStrings.brightness,
+                    <num>[.25, .5, .75, 1],
+                    sheetPreferences.brightness,
+                    (num v) =>
+                        sheetPreferences.copyWith(brightness: v.toDouble()),
+                    update,
+                  ),
+                  const ListTile(title: Text(ReaderStrings.readingMode)),
+                  ...ReaderNavigationMode.values.map(
+                    (ReaderNavigationMode v) => ListTile(
+                      selected: v == sheetPreferences.navigationMode,
+                      title: Text(
+                        v == ReaderNavigationMode.horizontalPages
+                            ? ReaderStrings.horizontal
+                            : ReaderStrings.vertical,
+                      ),
+                      trailing: v == sheetPreferences.navigationMode
+                          ? const Icon(Icons.check)
+                          : null,
+                      onTap: () {
+                        final next = sheetPreferences.copyWith(
+                          navigationMode: v,
+                        );
+                        update(next);
+                      },
+                    ),
+                  ),
+                  ListTile(
+                    title: const Text(ReaderStrings.pageAnimation),
+                    subtitle:
+                        sheetPreferences.navigationMode ==
+                            ReaderNavigationMode.verticalScroll
+                        ? const Text(ReaderStrings.animationVerticalHint)
+                        : null,
+                  ),
+                  if (sheetPreferences.navigationMode ==
+                      ReaderNavigationMode.horizontalPages)
+                    ...ReaderPageAnimation.values.map(
+                      (ReaderPageAnimation v) => ListTile(
+                        selected: v == sheetPreferences.pageAnimation,
+                        title: Text(
+                          v == ReaderPageAnimation.slide
+                              ? ReaderStrings.slide
+                              : ReaderStrings.noAnimation,
+                        ),
+                        trailing: v == sheetPreferences.pageAnimation
+                            ? const Icon(Icons.check)
+                            : null,
+                        onTap: () {
+                          final next = sheetPreferences.copyWith(
+                            pageAnimation: v,
+                          );
+                          update(next);
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showDeviceSheet() {
+    TextReaderPreferences sheetPreferences = _preferences;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _palette.panel,
+      builder: (BuildContext c) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setSheetState) {
+          void update(TextReaderPreferences next) {
+            final TextReaderPreferences normalized = next.normalized();
+            setSheetState(() => sheetPreferences = normalized);
+            unawaited(_updatePreferences(normalized));
+          }
+
+          return SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                const ListTile(title: Text(ReaderStrings.deviceCapabilities)),
+                if (_platformCapabilities.keepScreenOn)
+                  SwitchListTile(
+                    title: const Text(ReaderStrings.keepScreenOn),
+                    value: sheetPreferences.keepScreenOn,
+                    onChanged: (bool value) =>
+                        update(sheetPreferences.copyWith(keepScreenOn: value)),
+                  ),
+                if (_platformCapabilities.immersiveMode)
+                  SwitchListTile(
+                    title: const Text(ReaderStrings.immersiveReading),
+                    value: sheetPreferences.immersiveMode,
+                    onChanged: (bool value) =>
+                        update(sheetPreferences.copyWith(immersiveMode: value)),
+                  ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showChoiceSheet<T>(
+    String title,
+    List<T> values,
+    T selected,
+    Future<void> Function(T) change,
+    String Function(T) label,
+  ) => showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: _palette.panel,
+    builder: (BuildContext c) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          ListTile(title: Text(title)),
+          ...values.map(
+            (T v) => ListTile(
+              selected: v == selected,
+              title: Text(label(v)),
+              trailing: v == selected ? const Icon(Icons.check) : null,
+              onTap: () {
+                unawaited(change(v));
+                Navigator.pop(c);
+              },
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+  void _showNumberSheet(String title, Map<String, List<num>> groups) {
+    TextReaderPreferences sheetPreferences = _preferences;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _palette.panel,
+      builder: (BuildContext c) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setSheetState) {
+          void update(TextReaderPreferences next) {
+            final TextReaderPreferences normalized = next.normalized();
+            setSheetState(() => sheetPreferences = normalized);
+            unawaited(_updatePreferences(normalized));
+          }
+
+          return SafeArea(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  ListTile(title: Text(title)),
+                  for (final MapEntry<String, List<num>> entry
+                      in groups.entries) ...<Widget>[
+                    ListTile(title: Text(entry.key)),
+                    Wrap(
+                      children: entry.value
+                          .map(
+                            (num value) => ChoiceChip(
+                              label: Text(_optionLabel(entry.key, value)),
+                              selected: _optionSelected(
+                                sheetPreferences,
+                                entry.key,
+                                value,
+                              ),
+                              onSelected: (_) {
+                                final TextReaderPreferences next =
+                                    switch (entry.key) {
+                                      ReaderStrings.lineHeight =>
+                                        sheetPreferences.copyWith(
+                                          lineHeight: value.toDouble(),
+                                        ),
+                                      ReaderStrings.paragraphSpacing =>
+                                        sheetPreferences.copyWith(
+                                          paragraphSpacing: value.toDouble(),
+                                        ),
+                                      ReaderStrings.firstLineIndent =>
+                                        sheetPreferences.copyWith(
+                                          firstLineIndent: value.toInt(),
+                                        ),
+                                      ReaderStrings.pageMargin =>
+                                        sheetPreferences.copyWith(
+                                          horizontalPadding: value.toDouble(),
+                                        ),
+                                      ReaderStrings.topMargin =>
+                                        sheetPreferences.copyWith(
+                                          topPadding: value.toDouble(),
+                                        ),
+                                      ReaderStrings.bottomMargin =>
+                                        sheetPreferences.copyWith(
+                                          bottomPadding: value.toDouble(),
+                                        ),
+                                      _ => sheetPreferences,
+                                    };
+                                update(next);
+                              },
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _choiceChips(
+    String title,
+    List<num> values,
+    num selected,
+    TextReaderPreferences Function(num) apply,
+    void Function(TextReaderPreferences) update,
+  ) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: <Widget>[
+      ListTile(title: Text(title)),
+      Wrap(
+        children: values
+            .map(
+              (num v) => ChoiceChip(
+                label: Text(_optionLabel(title, v)),
+                selected: v == selected,
+                onSelected: (_) => update(apply(v)),
+              ),
+            )
+            .toList(),
+      ),
+    ],
+  );
+
+  bool _optionSelected(
+    TextReaderPreferences preferences,
+    String field,
+    num value,
+  ) => switch (field) {
+    ReaderStrings.lineHeight => preferences.lineHeight == value,
+    ReaderStrings.paragraphSpacing => preferences.paragraphSpacing == value,
+    ReaderStrings.firstLineIndent => preferences.firstLineIndent == value,
+    ReaderStrings.pageMargin => preferences.horizontalPadding == value,
+    ReaderStrings.topMargin => preferences.topPadding == value,
+    ReaderStrings.bottomMargin => preferences.bottomPadding == value,
+    ReaderStrings.fontSize => preferences.fontSize == value,
+    ReaderStrings.fontWeight => preferences.fontWeight == value,
+    ReaderStrings.letterSpacing => preferences.letterSpacing == value,
+    ReaderStrings.brightness => preferences.brightness == value,
+    _ => false,
+  };
+
+  String _optionLabel(String field, num value) {
+    if (field == ReaderStrings.firstLineIndent) {
+      return switch (value.toInt()) {
+        0 => ReaderStrings.none,
+        1 => ReaderStrings.oneCharacter,
+        _ => ReaderStrings.twoCharacters,
+      };
+    }
+    if (field == ReaderStrings.pageMargin) {
+      return value == 16
+          ? ReaderStrings.narrow
+          : value == 24
+          ? ReaderStrings.standard
+          : ReaderStrings.wide;
+    }
+    if (field == ReaderStrings.lineHeight ||
+        field == ReaderStrings.paragraphSpacing) {
+      final num compact = field == ReaderStrings.lineHeight ? 1.5 : 8;
+      final num standard = field == ReaderStrings.lineHeight ? 1.8 : 14;
+      return value == compact
+          ? ReaderStrings.compact
+          : value == standard
+          ? ReaderStrings.standard
+          : ReaderStrings.relaxed;
+    }
+    if (field == ReaderStrings.fontSize) {
+      return value == 16
+          ? ReaderStrings.small
+          : value == 19
+          ? ReaderStrings.standard
+          : value == 22
+          ? ReaderStrings.large
+          : value == 26
+          ? ReaderStrings.extraLarge
+          : ReaderStrings.huge;
+    }
+    if (field == ReaderStrings.fontWeight) {
+      return value == 400
+          ? ReaderStrings.regular
+          : value == 500
+          ? ReaderStrings.medium
+          : ReaderStrings.bold;
+    }
+    if (field == ReaderStrings.letterSpacing) {
+      return value == 0
+          ? ReaderStrings.compact
+          : value == .2
+          ? ReaderStrings.standard
+          : ReaderStrings.relaxed;
+    }
+    if (field == ReaderStrings.brightness) {
+      return value == .25
+          ? ReaderStrings.percent25
+          : value == .5
+          ? ReaderStrings.percent50
+          : value == .75
+          ? ReaderStrings.percent75
+          : ReaderStrings.percent100;
+    }
+    return '$value';
   }
 }
 

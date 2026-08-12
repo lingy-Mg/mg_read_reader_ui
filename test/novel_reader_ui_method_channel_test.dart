@@ -23,13 +23,16 @@ void main() {
 
   test('screen awake uses the private system channel', () async {
     final MethodChannelReaderPlatform platform = MethodChannelReaderPlatform();
-    await platform.setKeepScreenOn(true);
-    await platform.setKeepScreenOn(false);
+    await platform.setReaderSystemUi(keepScreenOn: true, immersiveMode: true);
+    await platform.setReaderSystemUi(keepScreenOn: false, immersiveMode: false);
 
     expect(calls.map((call) => call.method), <String>[
-      'setKeepScreenOn',
-      'setKeepScreenOn',
+      'setReaderSystemUi',
+      'setReaderSystemUi',
     ]);
-    expect(calls.map((call) => call.arguments), <bool>[true, false]);
+    expect(calls.map((call) => call.arguments), <Map<String, bool>>[
+      <String, bool>{'keepScreenOn': true, 'immersiveMode': true},
+      <String, bool>{'keepScreenOn': false, 'immersiveMode': false},
+    ]);
   });
 }

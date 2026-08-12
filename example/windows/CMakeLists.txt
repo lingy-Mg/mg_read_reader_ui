@@ -47,6 +47,8 @@ endfunction()
 
 # Flutter library and tool build rules.
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
+# This example is distributed as a single Windows x64 build.
+set(FLUTTER_TARGET_PLATFORM "windows-x64")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
 # Application build; see runner/CMakeLists.txt.

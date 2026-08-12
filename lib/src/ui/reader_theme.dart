@@ -2,6 +2,11 @@ import 'package:flutter/material.dart';
 
 import '../api/models.dart';
 
+const String readerDefaultFontFamily = 'MiSans';
+const String readerFontPackageName = 'novel_reader_ui';
+const String readerPackageFontFamily =
+    'packages/$readerFontPackageName/$readerDefaultFontFamily';
+
 @immutable
 class ReaderPalette {
   const ReaderPalette({
@@ -66,10 +71,14 @@ class ReaderPalette {
 
 String? readerFontFamily(ReaderFontPreset preset) {
   return switch (preset) {
-    ReaderFontPreset.system => null,
+    ReaderFontPreset.system => readerDefaultFontFamily,
     ReaderFontPreset.sansSerif => 'sans-serif',
     ReaderFontPreset.serif => 'serif',
   };
+}
+
+String? readerFontPackageFor(ReaderFontPreset preset) {
+  return preset == ReaderFontPreset.system ? readerFontPackageName : null;
 }
 
 List<String> readerFontFallback(ReaderFontPreset preset) {

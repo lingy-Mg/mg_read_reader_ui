@@ -23,6 +23,11 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // Release APKs are intentionally built for Android ARM64 only.
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
     }
 
     buildTypes {

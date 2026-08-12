@@ -41,7 +41,9 @@ class TextPaginator {
     required TextStyle titleStyle,
     required TextStyle bodyStyle,
     required double paragraphSpacing,
+    int firstLineIndent = 2,
     TextDirection textDirection = TextDirection.ltr,
+    TextScaler textScaler = TextScaler.noScaling,
   }) {
     if (width <= 0 || height <= 0) return const <ReaderPage>[];
 
@@ -52,6 +54,7 @@ class TextPaginator {
       width,
       titleStyle,
       textDirection,
+      textScaler,
     ).height;
     usedHeight += 28;
     var showsTitle = true;
@@ -84,6 +87,8 @@ class TextPaginator {
           style: bodyStyle,
           textDirection: textDirection,
           addIndent: paragraphStart,
+          firstLineIndent: firstLineIndent,
+          textScaler: textScaler,
         );
 
         if (end <= offset) {
@@ -108,12 +113,15 @@ class TextPaginator {
 
         final String chunk = source.substring(offset, end);
         final bool paragraphEnd = end == source.length;
-        final String display = paragraphStart ? '\u3000\u3000$chunk' : chunk;
+        final String display = paragraphStart
+            ? '${'\u3000' * firstLineIndent}$chunk'
+            : chunk;
         final double chunkHeight = _measure(
           display,
           width,
           bodyStyle,
           textDirection,
+          textScaler,
         ).height;
         blocks.add(
           ReaderPageBlock(
@@ -166,6 +174,8 @@ class TextPaginator {
     required TextStyle style,
     required TextDirection textDirection,
     required bool addIndent,
+    required int firstLineIndent,
+    required TextScaler textScaler,
   }) {
     int low = start;
     int high = source.length;
@@ -174,8 +184,16 @@ class TextPaginator {
       mid = _safeBoundary(source, mid);
       if (mid <= low) mid = low + 1;
       final String chunk = source.substring(start, mid);
-      final String display = addIndent ? '\u3000\u3000$chunk' : chunk;
-      final Size size = _measure(display, availableWidth, style, textDirection);
+      final String display = addIndent
+          ? '${'\u3000' * firstLineIndent}$chunk'
+          : chunk;
+      final Size size = _measure(
+        display,
+        availableWidth,
+        style,
+        textDirection,
+        textScaler,
+      );
       if (size.height <= availableHeight + 0.1) {
         low = mid;
       } else {
@@ -203,11 +221,12 @@ class TextPaginator {
     double width,
     TextStyle style,
     TextDirection textDirection,
+    TextScaler textScaler,
   ) {
     final TextPainter painter = TextPainter(
       text: TextSpan(text: text, style: style),
       textDirection: textDirection,
-      textScaler: TextScaler.noScaling,
+      textScaler: textScaler,
     )..layout(maxWidth: width);
     return painter.size;
   }

@@ -435,7 +435,7 @@ Android 与 Windows 原生实现必须保持语义一致。新增原生能力时
 dart format --output=none --set-exit-if-changed .
 flutter analyze
 flutter test
-flutter build apk --debug -t example/lib/main.dart
+flutter build apk --debug --target-platform android-arm64 -t example/lib/main.dart
 ```
 
 Windows 主机或 CI 另执行：

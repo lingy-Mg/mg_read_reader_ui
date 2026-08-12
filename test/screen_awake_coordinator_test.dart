@@ -31,12 +31,60 @@ void main() {
       ReaderPlatform.instance = original;
     }
   });
+
+  test('immersive mode is independently aggregated and released', () async {
+    final ReaderPlatform original = ReaderPlatform.instance;
+    final _RecordingPlatform platform = _RecordingPlatform();
+    ReaderPlatform.instance = platform;
+    final Object holder = Object();
+    try {
+      await ScreenAwakeCoordinator.instance.acquire(
+        holder,
+        keepScreenOn: false,
+        immersiveMode: true,
+      );
+      await ScreenAwakeCoordinator.instance.acquire(
+        holder,
+        keepScreenOn: false,
+        immersiveMode: true,
+      );
+      expect(platform.systemUi, <_SystemUi>[const _SystemUi(false, true)]);
+      await ScreenAwakeCoordinator.instance.release(holder);
+      expect(platform.systemUi, <_SystemUi>[
+        const _SystemUi(false, true),
+        const _SystemUi(false, false),
+      ]);
+    } finally {
+      await ScreenAwakeCoordinator.instance.release(holder);
+      ReaderPlatform.instance = original;
+    }
+  });
 }
 
 class _RecordingPlatform extends ReaderPlatform
     with MockPlatformInterfaceMixin {
   final List<bool> values = <bool>[];
+  final List<_SystemUi> systemUi = <_SystemUi>[];
 
   @override
-  Future<void> setKeepScreenOn(bool enabled) async => values.add(enabled);
+  Future<void> setReaderSystemUi({
+    required bool keepScreenOn,
+    required bool immersiveMode,
+  }) async {
+    values.add(keepScreenOn);
+    systemUi.add(_SystemUi(keepScreenOn, immersiveMode));
+  }
+}
+
+class _SystemUi {
+  const _SystemUi(this.keepScreenOn, this.immersiveMode);
+  final bool keepScreenOn;
+  final bool immersiveMode;
+  @override
+  bool operator ==(Object other) =>
+      other is _SystemUi &&
+      keepScreenOn == other.keepScreenOn &&
+      immersiveMode == other.immersiveMode;
+  @override
+  int get hashCode => Object.hash(keepScreenOn, immersiveMode);
 }

@@ -68,6 +68,10 @@ enable_testing()
 
 # Add the Google Test dependency.
 include(FetchContent)
+# GoogleTest 1.11.0 declares an obsolete minimum CMake version. CMake 4 no
+# longer supports policy compatibility below 3.10, so set the supported floor
+# for this FetchContent dependency without editing its generated source tree.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
 FetchContent_Declare(
   googletest
   URL https://github.com/google/googletest/archive/release-1.11.0.zip
