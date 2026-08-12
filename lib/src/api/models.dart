@@ -103,12 +103,24 @@ class ReaderProgress {
     this.bookFraction = 0,
   });
 
+  /// Creates the book information preview position before chapter zero.
+  const ReaderProgress.bookPreview()
+    : chapterId = '',
+      paragraphId = '',
+      characterOffset = 0,
+      chapterIndex = -1,
+      chapterFraction = 0,
+      bookFraction = 0;
+
   final String chapterId;
   final String paragraphId;
   final int characterOffset;
   final int chapterIndex;
   final double chapterFraction;
   final double bookFraction;
+
+  /// Whether this position represents the metadata page before chapter zero.
+  bool get isBookPreview => chapterIndex < 0;
 
   ReaderProgress copyWith({
     String? chapterId,

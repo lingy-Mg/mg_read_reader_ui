@@ -175,6 +175,17 @@ class DemoReaderDataSource implements TextReaderDataSource {
   }
 
   @override
+  Future<ReaderChapterInfo> loadChapterAtIndex(String bookId, int index) async {
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    final TextChapterContent chapter = _chapters[index];
+    return ReaderChapterInfo(
+      id: chapter.chapterId,
+      title: chapter.title,
+      index: index,
+    );
+  }
+
+  @override
   Future<TextChapterContent> loadChapterContent(
     String bookId,
     String chapterId,

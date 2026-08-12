@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -8,6 +9,7 @@ import '../api/contracts.dart';
 import '../api/controller.dart';
 import '../api/models.dart';
 import '../pagination/text_paginator.dart';
+import '../platform/reader_platform.dart';
 import '../platform/screen_awake_coordinator.dart';
 import 'reader_strings.dart';
 import 'reader_theme.dart';
@@ -40,7 +42,7 @@ class TextReaderView extends StatefulWidget {
 
 class _TextReaderViewState extends State<TextReaderView> {
   static const Duration _saveDelay = Duration(milliseconds: 800);
-  static const int _chapterCacheLimit = 3;
+  static const int _chapterCacheLimit = 2;
 
   final TextPaginator _paginator = const TextPaginator();
   final Object _awakeHolder = Object();
@@ -54,6 +56,9 @@ class _TextReaderViewState extends State<TextReaderView> {
   late AppLifecycleListener _lifecycleListener;
   final PageController _pageController = PageController(initialPage: 1);
   Timer? _saveTimer;
+  Timer? _noticeTimer;
+  Timer? _clockTimer;
+  Timer? _wheelResetTimer;
 
   ReaderBookInfo? _book;
   final List<ReaderChapterInfo> _catalog = <ReaderChapterInfo>[];
@@ -62,30 +67,36 @@ class _TextReaderViewState extends State<TextReaderView> {
   bool _catalogHasMore = false;
   bool _catalogLoading = false;
   TextChapterContent? _content;
+  ReaderChapterInfo? _currentChapterInfo;
   List<ReaderPage> _pages = const <ReaderPage>[];
   List<ReaderBookmark> _bookmarks = const <ReaderBookmark>[];
   TextReaderPreferences _preferences = TextReaderPreferences.defaults;
   ReaderProgress? _progress;
   ReaderFailure? _failure;
   Size? _layoutSize;
-  int _chapterIndex = 0;
+  int _chapterIndex = -1;
   int _pageIndex = 0;
   int _requestGeneration = 0;
   int _sessionGeneration = 0;
   bool _loading = true;
   bool _controlsVisible = false;
   bool _foreground = true;
+  ReaderLifecycleState _lifecycleState = ReaderLifecycleState.foreground;
   bool _awakeAcquired = false;
   bool _changingChapter = false;
   bool _disposed = false;
   double? _sliderPreview;
+  double _wheelDelta = 0;
+  String? _noticeMessage;
+  DateTime _clock = DateTime.now();
 
   ReaderObserver get _observer => widget.observer ?? const ReaderObserver();
   ReaderPalette get _palette => ReaderPalette.fromPreset(_preferences.theme);
-  ReaderChapterInfo? get _currentChapter =>
-      _catalog.isEmpty || _chapterIndex >= _catalog.length
-      ? null
-      : _catalog[_chapterIndex];
+  ReaderChapterInfo? get _currentChapter => _currentChapterInfo;
+  bool get _isBookPreview =>
+      !_loading && _failure == null && _progress?.isBookPreview == true;
+  bool get _keepScreenOnSupported =>
+      ReaderPlatform.instance.supportsKeepScreenOn;
 
   @override
   void initState() {
@@ -94,6 +105,9 @@ class _TextReaderViewState extends State<TextReaderView> {
     _bindController();
     _verticalController.addListener(_handleVerticalScroll);
     _lifecycleListener = AppLifecycleListener(onStateChange: _handleLifecycle);
+    _clockTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (mounted) setState(() => _clock = DateTime.now());
+    });
     unawaited(_initialize());
   }
 
@@ -119,6 +133,9 @@ class _TextReaderViewState extends State<TextReaderView> {
     _requestGeneration++;
     _sessionGeneration++;
     _saveTimer?.cancel();
+    _noticeTimer?.cancel();
+    _clockTimer?.cancel();
+    _wheelResetTimer?.cancel();
     unawaited(_flushProgress());
     unawaited(_releaseAwake());
     unawaited(
@@ -141,6 +158,7 @@ class _TextReaderViewState extends State<TextReaderView> {
       previousPage: _previousPage,
       nextChapter: _nextChapter,
       previousChapter: _previousChapter,
+      showBookPreview: _showBookPreview,
       toggleControls: () async => _setControlsVisible(!_controlsVisible),
       showControls: () async => _setControlsVisible(true),
       hideControls: () async => _setControlsVisible(false),
@@ -156,12 +174,28 @@ class _TextReaderViewState extends State<TextReaderView> {
     _sessionGeneration++;
     _chapterCache.clear();
     _catalog.clear();
+    _book = null;
+    _bookmarks = const <ReaderBookmark>[];
+    _catalogCursor = null;
+    _catalogTotal = 0;
+    _catalogHasMore = false;
+    _catalogLoading = false;
     _content = null;
+    _currentChapterInfo = null;
     _pages = const <ReaderPage>[];
     _progress = null;
     _failure = null;
     _layoutSize = null;
-    if (mounted) setState(() => _loading = true);
+    _chapterIndex = -1;
+    _pageIndex = 0;
+    _changingChapter = false;
+    _controlsVisible = false;
+    _sliderPreview = null;
+    _noticeMessage = null;
+    _wheelDelta = 0;
+    _wheelResetTimer?.cancel();
+    _loading = true;
+    if (mounted) setState(() {});
     await _initialize();
   }
 
@@ -198,23 +232,30 @@ class _TextReaderViewState extends State<TextReaderView> {
 
       _book = results[0] as ReaderBookInfo;
       _mergeCatalog(results[1] as ChapterCatalogPage);
-      _progress = results[2] as ReaderProgress?;
+      _progress =
+          results[2] as ReaderProgress? ?? const ReaderProgress.bookPreview();
       _preferences = results[3] as TextReaderPreferences;
       _bookmarks = results[4] as List<ReaderBookmark>;
 
-      if (_catalog.isEmpty) {
-        throw const ReaderFailure(ReaderFailureKind.data, '这本书还没有可阅读的章节');
-      }
-
-      final String targetChapter = _progress?.chapterId ?? _catalog.first.id;
-      while (_catalog.indexWhere((item) => item.id == targetChapter) < 0 &&
-          _catalogHasMore) {
-        await _loadMoreCatalog(notify: false);
+      if (_progress!.isBookPreview) {
+        _content = null;
+        _currentChapterInfo = null;
+        _chapterIndex = -1;
+      } else {
+        if (_catalogTotal <= 0) {
+          throw const ReaderFailure(
+            ReaderFailureKind.data,
+            '已保存正文进度，但书籍没有可用章节',
+          );
+        }
+        ReaderChapterInfo? target = _catalog
+            .where((item) => item.id == _progress!.chapterId)
+            .firstOrNull;
+        target ??= await _chapterInfoAtIndex(_progress!.chapterIndex);
+        if (!_isSessionCurrent(generation)) return;
+        await _openChapter(target.id, initial: true);
         if (!_isSessionCurrent(generation)) return;
       }
-
-      await _openChapter(targetChapter, initial: true);
-      if (!_isSessionCurrent(generation)) return;
       _loading = false;
       _failure = null;
       if (mounted) setState(() {});
@@ -275,13 +316,35 @@ class _TextReaderViewState extends State<TextReaderView> {
     _catalogHasMore = page.hasMore;
   }
 
+  Future<ReaderChapterInfo> _chapterInfoAtIndex(int index) async {
+    if (index < 0 || (_catalogTotal > 0 && index >= _catalogTotal)) {
+      throw ReaderFailure(ReaderFailureKind.data, '章节索引超出范围: $index');
+    }
+    final ReaderChapterInfo? cached = _catalog
+        .where((item) => item.index == index)
+        .firstOrNull;
+    if (cached != null) return cached;
+    final ReaderChapterInfo chapter = await widget.dataSource
+        .loadChapterAtIndex(widget.bookId, index);
+    if (chapter.index != index || chapter.id.isEmpty) {
+      throw const ReaderFailure(ReaderFailureKind.data, '章节定位接口返回了无效数据');
+    }
+    if (_catalog.every((item) => item.id != chapter.id)) {
+      _catalog.add(chapter);
+      _catalog.sort((a, b) => a.index.compareTo(b.index));
+    }
+    return chapter;
+  }
+
   Future<void> _loadMoreCatalog({bool notify = true}) async {
     if (_catalogLoading || !_catalogHasMore) return;
+    final int generation = _sessionGeneration;
     _catalogLoading = true;
     if (notify && mounted) setState(() {});
     try {
       final ChapterCatalogPage page = await widget.dataSource
           .loadChapterCatalog(widget.bookId, cursor: _catalogCursor);
+      if (!_isSessionCurrent(generation)) return;
       _mergeCatalog(page);
     } catch (error) {
       await _reportFailure(_asFailure(error, ReaderFailureKind.data));
@@ -296,10 +359,15 @@ class _TextReaderViewState extends State<TextReaderView> {
     bool initial = false,
     bool forceRefresh = false,
     bool openAtEnd = false,
+    double? targetChapterFraction,
   }) async {
     if (chapterId.isEmpty || _changingChapter) return;
-    final int targetIndex = _catalog.indexWhere((item) => item.id == chapterId);
-    if (targetIndex < 0) return;
+    final ReaderChapterInfo? targetInfo = _catalog
+        .where((item) => item.id == chapterId)
+        .firstOrNull;
+    if (targetInfo == null) return;
+    final TextChapterContent? previousContent = _content;
+    final int previousIndex = _chapterIndex;
     final int generation = ++_requestGeneration;
     _changingChapter = true;
     if (!initial && mounted) setState(() {});
@@ -312,8 +380,18 @@ class _TextReaderViewState extends State<TextReaderView> {
       );
       if (!_isCurrent(generation)) return;
       _validateChapter(chapter);
-      _cacheChapter(chapter);
-      _chapterIndex = targetIndex;
+      if (openAtEnd &&
+          previousContent != null &&
+          previousIndex == targetInfo.index + 1) {
+        _chapterCache
+          ..clear()
+          ..[chapter.chapterId] = chapter
+          ..[previousContent.chapterId] = previousContent;
+      } else {
+        _cacheChapter(chapter);
+      }
+      _chapterIndex = targetInfo.index;
+      _currentChapterInfo = targetInfo;
       _content = chapter;
       _pages = const <ReaderPage>[];
       _layoutSize = null;
@@ -324,24 +402,48 @@ class _TextReaderViewState extends State<TextReaderView> {
       final TextParagraph first = chapter.paragraphs.isEmpty
           ? const TextParagraph(id: '', text: '')
           : chapter.paragraphs.first;
-      if (initial && saved?.chapterId == chapterId) {
-        _progress = saved;
+      if (initial && saved?.chapterId == chapterId && !saved!.isBookPreview) {
+        final int total = _catalogTotal > 0 ? _catalogTotal : _catalog.length;
+        _progress = saved.copyWith(
+          chapterIndex: targetInfo.index,
+          bookFraction: total <= 0
+              ? 0
+              : ((targetInfo.index + saved.chapterFraction) / total).clamp(
+                  0,
+                  1,
+                ),
+        );
       } else {
-        final TextParagraph anchor = openAtEnd && chapter.paragraphs.isNotEmpty
-            ? chapter.paragraphs.last
-            : first;
+        final double fraction =
+            targetChapterFraction?.clamp(0, 1) ?? (openAtEnd ? 1 : 0);
+        final int paragraphIndex = chapter.paragraphs.isEmpty
+            ? 0
+            : (fraction * chapter.paragraphs.length).floor().clamp(
+                0,
+                chapter.paragraphs.length - 1,
+              );
+        final TextParagraph anchor = chapter.paragraphs.isEmpty
+            ? first
+            : chapter.paragraphs[paragraphIndex];
+        final int offset = openAtEnd
+            ? anchor.text.length
+            : (fraction * anchor.text.length).floor().clamp(
+                0,
+                anchor.text.length,
+              );
         _progress = _progressForAnchor(
           anchor.id,
-          openAtEnd ? anchor.text.length : 0,
-          chapterFraction: openAtEnd ? 1 : 0,
+          offset,
+          chapterFraction: fraction,
         );
       }
       _failure = null;
       if (mounted) setState(() {});
       _publishSnapshot();
-      await _notify(() => _observer.onChapterChanged(_catalog[targetIndex]));
+      await _notify(() => _observer.onChapterChanged(targetInfo));
+      await _syncAwake();
       _scheduleProgressSave(immediate: true);
-      unawaited(_prefetchAround(targetIndex));
+      if (!openAtEnd) unawaited(_prefetchNext(targetInfo.index));
       if (_preferences.navigationMode == ReaderNavigationMode.verticalScroll) {
         _scheduleVerticalRestore();
       }
@@ -382,20 +484,19 @@ class _TextReaderViewState extends State<TextReaderView> {
     }
   }
 
-  Future<void> _prefetchAround(int index) async {
-    for (final int candidate in <int>[index - 1, index + 1]) {
-      if (candidate < 0 || candidate >= _catalog.length) continue;
-      final String id = _catalog[candidate].id;
-      if (_chapterCache.containsKey(id)) continue;
-      try {
-        final TextChapterContent content = await widget.dataSource
-            .loadChapterContent(widget.bookId, id);
-        if (_disposed) return;
-        _validateChapter(content);
-        _cacheChapter(content);
-      } catch (_) {
-        // Prefetch is intentionally best effort. Foreground loading reports errors.
-      }
+  Future<void> _prefetchNext(int currentIndex) async {
+    final int nextIndex = currentIndex + 1;
+    if (_catalogTotal > 0 && nextIndex >= _catalogTotal) return;
+    try {
+      final ReaderChapterInfo next = await _chapterInfoAtIndex(nextIndex);
+      if (_chapterCache.containsKey(next.id)) return;
+      final TextChapterContent content = await widget.dataSource
+          .loadChapterContent(widget.bookId, next.id);
+      if (_disposed || _chapterIndex != currentIndex) return;
+      _validateChapter(content);
+      _cacheChapter(content);
+    } catch (_) {
+      // Prefetch is best effort. Foreground loading reports actionable errors.
     }
   }
 
@@ -537,18 +638,79 @@ class _TextReaderViewState extends State<TextReaderView> {
   }
 
   Future<void> _nextChapter() async {
-    if (_chapterIndex + 1 >= _catalog.length && _catalogHasMore) {
-      await _loadMoreCatalog();
+    final int nextIndex = _chapterIndex + 1;
+    final int total = _catalogTotal > 0 ? _catalogTotal : _catalog.length;
+    if (nextIndex >= total) {
+      _restoreCurrentHorizontalPage();
+      _showNotice(ReaderStrings.noNextChapter);
+      return;
     }
-    if (_chapterIndex + 1 < _catalog.length) {
-      await _openChapter(_catalog[_chapterIndex + 1].id);
+    try {
+      final ReaderChapterInfo next = await _chapterInfoAtIndex(nextIndex);
+      await _openChapter(next.id);
+    } catch (error) {
+      _restoreCurrentHorizontalPage();
+      await _reportFailure(_asFailure(error, ReaderFailureKind.data));
     }
   }
 
   Future<void> _previousChapter() async {
-    if (_chapterIndex > 0) {
-      await _openChapter(_catalog[_chapterIndex - 1].id, openAtEnd: true);
+    if (_chapterIndex < 0) {
+      _showNotice(ReaderStrings.noPreviousChapter);
+      return;
     }
+    if (_chapterIndex == 0) {
+      await _showBookPreview();
+      return;
+    }
+    try {
+      final ReaderChapterInfo previous = await _chapterInfoAtIndex(
+        _chapterIndex - 1,
+      );
+      await _openChapter(previous.id, openAtEnd: true);
+    } catch (error) {
+      _restoreCurrentHorizontalPage();
+      await _reportFailure(_asFailure(error, ReaderFailureKind.data));
+    }
+  }
+
+  Future<void> _showBookPreview() async {
+    _requestGeneration++;
+    _saveTimer?.cancel();
+    await _flushProgress();
+    _content = null;
+    _chapterCache.clear();
+    _currentChapterInfo = null;
+    _chapterIndex = -1;
+    _pageIndex = 0;
+    _pages = const <ReaderPage>[];
+    _layoutSize = null;
+    _paragraphKeys.clear();
+    _progress = const ReaderProgress.bookPreview();
+    _changingChapter = false;
+    _failure = null;
+    if (mounted) setState(() {});
+    await _releaseAwake();
+    _scheduleProgressSave(immediate: true);
+    _publishSnapshot();
+  }
+
+  void _restoreCurrentHorizontalPage() {
+    if (_preferences.navigationMode != ReaderNavigationMode.horizontalPages) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_pageController.hasClients) return;
+      _pageController.jumpToPage(_pageIndex + 1);
+    });
+  }
+
+  void _showNotice(String message) {
+    _noticeTimer?.cancel();
+    if (mounted) setState(() => _noticeMessage = message);
+    _noticeTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _noticeMessage = null);
+    });
   }
 
   void _onHorizontalPageChanged(int rawIndex) {
@@ -684,11 +846,9 @@ class _TextReaderViewState extends State<TextReaderView> {
       AppLifecycleState.paused => ReaderLifecycleState.background,
       AppLifecycleState.detached => ReaderLifecycleState.detached,
     };
+    if (_lifecycleState == normalized) return;
+    _lifecycleState = normalized;
     final bool foreground = normalized == ReaderLifecycleState.foreground;
-    if (_foreground == foreground &&
-        normalized == ReaderLifecycleState.foreground) {
-      return;
-    }
     _foreground = foreground;
     if (!foreground) {
       unawaited(_releaseAwake());
@@ -706,6 +866,7 @@ class _TextReaderViewState extends State<TextReaderView> {
         !_disposed &&
         _foreground &&
         _content != null &&
+        _keepScreenOnSupported &&
         _preferences.keepScreenOn;
     if (shouldAcquire && !_awakeAcquired) {
       try {
@@ -738,7 +899,7 @@ class _TextReaderViewState extends State<TextReaderView> {
   void _publishSnapshot() {
     _controller.updateSnapshot(
       TextReaderSnapshot(
-        isReady: _content != null && _failure == null,
+        isReady: (_content != null || _isBookPreview) && _failure == null,
         isLoading: _loading || _changingChapter,
         controlsVisible: _controlsVisible,
         book: _book,
@@ -778,59 +939,89 @@ class _TextReaderViewState extends State<TextReaderView> {
       value: palette.systemBrightness == Brightness.dark
           ? SystemUiOverlayStyle.light
           : SystemUiOverlayStyle.dark,
-      child: PopScope<void>(
-        canPop: false,
-        onPopInvokedWithResult: (bool didPop, void result) {
-          if (!didPop) unawaited(_requestExit());
-        },
-        child: Material(
-          color: palette.background,
-          child: CallbackShortcuts(
-            bindings: <ShortcutActivator, VoidCallback>{
-              const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
-                  unawaited(_nextPage()),
-              const SingleActivator(LogicalKeyboardKey.pageDown): () =>
-                  unawaited(_nextPage()),
-              const SingleActivator(LogicalKeyboardKey.space): () =>
-                  unawaited(_nextPage()),
-              const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
-                  unawaited(_previousPage()),
-              const SingleActivator(LogicalKeyboardKey.pageUp): () =>
-                  unawaited(_previousPage()),
-              const SingleActivator(
-                LogicalKeyboardKey.space,
-                shift: true,
-              ): () =>
-                  unawaited(_previousPage()),
-              const SingleActivator(LogicalKeyboardKey.escape): () =>
-                  unawaited(_requestExit()),
-            },
-            child: Focus(
-              focusNode: _focusNode,
-              autofocus: true,
-              child: LayoutBuilder(
-                builder: (BuildContext context, BoxConstraints constraints) {
-                  _ensurePagination(constraints.biggest);
-                  return Stack(
-                    fit: StackFit.expand,
-                    children: <Widget>[
-                      _buildContent(),
-                      if (_content != null) _buildChrome(),
-                      IgnorePointer(
-                        child: ColoredBox(
-                          color: Colors.black.withValues(
-                            alpha: (1 - _preferences.brightness) * 0.65,
+      child: Theme(
+        data: _readerMaterialTheme(palette),
+        child: PopScope<void>(
+          canPop: false,
+          onPopInvokedWithResult: (bool didPop, void result) {
+            if (!didPop) unawaited(_requestExit());
+          },
+          child: Material(
+            color: palette.background,
+            child: CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
+                    unawaited(_nextPage()),
+                const SingleActivator(LogicalKeyboardKey.pageDown): () =>
+                    unawaited(_nextPage()),
+                const SingleActivator(LogicalKeyboardKey.space): () =>
+                    unawaited(_nextPage()),
+                const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
+                    unawaited(_previousPage()),
+                const SingleActivator(LogicalKeyboardKey.pageUp): () =>
+                    unawaited(_previousPage()),
+                const SingleActivator(
+                  LogicalKeyboardKey.space,
+                  shift: true,
+                ): () =>
+                    unawaited(_previousPage()),
+                const SingleActivator(LogicalKeyboardKey.escape): () =>
+                    unawaited(_requestExit()),
+              },
+              child: Focus(
+                focusNode: _focusNode,
+                autofocus: true,
+                child: LayoutBuilder(
+                  builder: (BuildContext context, BoxConstraints constraints) {
+                    _ensurePagination(constraints.biggest);
+                    return ScrollConfiguration(
+                      behavior: const _ReaderScrollBehavior(),
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: <Widget>[
+                          _buildContent(),
+                          if (_content != null) _buildChrome(),
+                          if (_noticeMessage != null)
+                            _ReaderNotice(message: _noticeMessage!),
+                          IgnorePointer(
+                            child: ColoredBox(
+                              color: Colors.black.withValues(
+                                alpha: (1 - _preferences.brightness) * 0.65,
+                              ),
+                            ),
                           ),
-                        ),
+                        ],
                       ),
-                    ],
-                  );
-                },
+                    );
+                  },
+                ),
               ),
             ),
           ),
         ),
       ),
+    );
+  }
+
+  ThemeData _readerMaterialTheme(ReaderPalette palette) {
+    final ColorScheme scheme =
+        ColorScheme.fromSeed(
+          seedColor: palette.accent,
+          brightness: palette.systemBrightness,
+        ).copyWith(
+          primary: palette.accent,
+          surface: palette.panel,
+          onSurface: palette.text,
+          outline: palette.divider,
+        );
+    return ThemeData(
+      useMaterial3: true,
+      brightness: palette.systemBrightness,
+      colorScheme: scheme,
+      fontFamily: readerFontFamily(_preferences.font),
+      fontFamilyFallback: readerFontFallback(_preferences.font),
+      scaffoldBackgroundColor: palette.background,
+      dividerColor: palette.divider,
     );
   }
 
@@ -866,10 +1057,130 @@ class _TextReaderViewState extends State<TextReaderView> {
         ),
       );
     }
+    if (_isBookPreview) return _buildBookPreview();
     if (_content == null) return const SizedBox.shrink();
     return _preferences.navigationMode == ReaderNavigationMode.horizontalPages
         ? _buildHorizontalReader()
         : _buildVerticalReader();
+  }
+
+  Widget _buildBookPreview() {
+    final ReaderBookInfo? book = _book;
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(28, 28, 28, 40),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 680),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: IconButton(
+                    tooltip: ReaderStrings.back,
+                    onPressed: _requestExit,
+                    icon: const Icon(Icons.arrow_back_ios_new_rounded),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Center(
+                  child: Container(
+                    width: 132,
+                    height: 176,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: <Color>[
+                          _palette.accent.withValues(alpha: 0.92),
+                          _palette.text.withValues(alpha: 0.78),
+                        ],
+                      ),
+                      boxShadow: <BoxShadow>[
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.18),
+                          blurRadius: 22,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
+                    ),
+                    child: const Icon(
+                      Icons.auto_stories_rounded,
+                      size: 54,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 30),
+                Text(
+                  book?.title ?? ReaderStrings.bookPreview,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: _palette.text,
+                    fontSize: 28,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if (book?.author?.isNotEmpty == true) ...<Widget>[
+                  const SizedBox(height: 10),
+                  Text(
+                    book!.author!,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: _palette.secondaryText),
+                  ),
+                ],
+                const SizedBox(height: 22),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: <Widget>[
+                    Icon(
+                      Icons.format_list_numbered_rounded,
+                      size: 18,
+                      color: _palette.secondaryText,
+                    ),
+                    const SizedBox(width: 7),
+                    Text(
+                      '$_catalogTotal 章',
+                      style: TextStyle(color: _palette.secondaryText),
+                    ),
+                  ],
+                ),
+                if (book?.description?.isNotEmpty == true) ...<Widget>[
+                  const SizedBox(height: 30),
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: _palette.panel.withValues(alpha: 0.7),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: _palette.divider),
+                    ),
+                    child: Text(
+                      book!.description!,
+                      style: TextStyle(
+                        color: _palette.text,
+                        fontSize: 16,
+                        height: 1.75,
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 30),
+                FilledButton.icon(
+                  onPressed: _catalogTotal > 0 ? _nextChapter : null,
+                  icon: const Icon(Icons.play_arrow_rounded),
+                  label: const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 14),
+                    child: Text(ReaderStrings.startReading),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _buildHorizontalReader() {
@@ -883,36 +1194,59 @@ class _TextReaderViewState extends State<TextReaderView> {
         ),
       );
     }
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onTapUp: (TapUpDetails details) {
-        final double fraction = details.localPosition.dx / context.size!.width;
-        if (fraction < 0.3) {
-          unawaited(_previousPage());
-        } else if (fraction > 0.7) {
-          unawaited(_nextPage());
-        } else {
-          _setControlsVisible(!_controlsVisible);
-        }
-      },
-      child: PageView.builder(
-        controller: _pageController,
-        physics: _preferences.pageAnimation == ReaderPageAnimation.none
-            ? const NeverScrollableScrollPhysics()
-            : const PageScrollPhysics(),
-        itemCount: _pages.length + 2,
-        onPageChanged: _onHorizontalPageChanged,
-        itemBuilder: (BuildContext context, int index) {
-          if (index == 0) {
-            return _chapterBoundary(ReaderStrings.previousChapter);
+    return Listener(
+      onPointerSignal: _handlePointerSignal,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapUp: (TapUpDetails details) {
+          final double fraction =
+              details.localPosition.dx / context.size!.width;
+          if (fraction < 0.3) {
+            unawaited(_previousPage());
+          } else if (fraction > 0.7) {
+            unawaited(_nextPage());
+          } else {
+            _setControlsVisible(!_controlsVisible);
           }
-          if (index == _pages.length + 1) {
-            return _chapterBoundary(ReaderStrings.nextChapter);
-          }
-          return _buildPage(_pages[index - 1], index - 1);
         },
+        child: PageView.builder(
+          controller: _pageController,
+          physics: const PageScrollPhysics(),
+          itemCount: _pages.length + 2,
+          onPageChanged: _onHorizontalPageChanged,
+          itemBuilder: (BuildContext context, int index) {
+            if (index == 0) {
+              return _chapterBoundary(ReaderStrings.previousChapter);
+            }
+            if (index == _pages.length + 1) {
+              return _chapterBoundary(ReaderStrings.nextChapter);
+            }
+            return _buildPage(_pages[index - 1], index - 1);
+          },
+        ),
       ),
     );
+  }
+
+  void _handlePointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent || _changingChapter) return;
+    final double delta =
+        event.scrollDelta.dy.abs() >= event.scrollDelta.dx.abs()
+        ? event.scrollDelta.dy
+        : event.scrollDelta.dx;
+    _wheelDelta += delta;
+    _wheelResetTimer?.cancel();
+    _wheelResetTimer = Timer(const Duration(milliseconds: 140), () {
+      _wheelDelta = 0;
+    });
+    if (_wheelDelta.abs() < 36) return;
+    final bool forward = _wheelDelta > 0;
+    _wheelDelta = 0;
+    if (forward) {
+      unawaited(_nextPage());
+    } else {
+      unawaited(_previousPage());
+    }
   }
 
   Widget _chapterBoundary(String label) {
@@ -970,7 +1304,12 @@ class _TextReaderViewState extends State<TextReaderView> {
                   ),
                 ),
                 Text(
-                  '${index + 1} / ${_pages.length}',
+                  '${((_progress?.bookFraction ?? 0) * 100).toStringAsFixed(1)}%  ·  ${index + 1}/${_pages.length}',
+                  style: TextStyle(color: _palette.secondaryText, fontSize: 11),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  _clockLabel,
                   style: TextStyle(color: _palette.secondaryText, fontSize: 11),
                 ),
               ],
@@ -1169,33 +1508,55 @@ class _TextReaderViewState extends State<TextReaderView> {
   }
 
   Widget _barAction(IconData icon, String label, VoidCallback action) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: action,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            Icon(icon, size: 22),
-            const SizedBox(height: 3),
-            Text(label, style: const TextStyle(fontSize: 11)),
-          ],
+    return Semantics(
+      button: true,
+      label: label,
+      child: Tooltip(
+        message: label,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: action,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(icon, size: 22),
+                const SizedBox(height: 3),
+                Text(label, style: const TextStyle(fontSize: 11)),
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
 
+  String get _clockLabel {
+    final String hour = _clock.hour.toString().padLeft(2, '0');
+    final String minute = _clock.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+
   Future<void> _jumpToBookFraction(double value) async {
     setState(() => _sliderPreview = null);
-    if (_catalog.isEmpty) return;
-    final int total = _catalogTotal > 0 ? _catalogTotal : _catalog.length;
-    int index = (value * (total - 1).clamp(0, total)).round();
-    while (index >= _catalog.length && _catalogHasMore) {
-      await _loadMoreCatalog();
+    if (value <= 0) {
+      await _showBookPreview();
+      return;
     }
-    index = index.clamp(0, _catalog.length - 1);
-    await _openChapter(_catalog[index].id);
+    final int total = _catalogTotal > 0 ? _catalogTotal : _catalog.length;
+    if (total <= 0) return;
+    final double exact = (value.clamp(0, 1) * total)
+        .clamp(0, total - 0.000001)
+        .toDouble();
+    final int index = exact.floor().clamp(0, total - 1);
+    final double chapterFraction = exact - index;
+    try {
+      final ReaderChapterInfo chapter = await _chapterInfoAtIndex(index);
+      await _openChapter(chapter.id, targetChapterFraction: chapterFraction);
+    } catch (error) {
+      await _reportFailure(_asFailure(error, ReaderFailureKind.data));
+    }
   }
 
   bool get _isCurrentBookmarked {
@@ -1310,7 +1671,9 @@ class _TextReaderViewState extends State<TextReaderView> {
                           setSheetState(() {});
                         },
                   child: Text(
-                    _catalogLoading ? ReaderStrings.loading : '加载更多章节',
+                    _catalogLoading
+                        ? ReaderStrings.loading
+                        : ReaderStrings.loadMoreChapters,
                   ),
                 ),
               );
@@ -1489,15 +1852,15 @@ class _TextReaderViewState extends State<TextReaderView> {
                       segments: const <ButtonSegment<ReaderFontPreset>>[
                         ButtonSegment(
                           value: ReaderFontPreset.system,
-                          label: Text('默认'),
+                          label: Text(ReaderStrings.systemFont),
                         ),
                         ButtonSegment(
                           value: ReaderFontPreset.sansSerif,
-                          label: Text('黑体'),
+                          label: Text(ReaderStrings.sansSerifFont),
                         ),
                         ButtonSegment(
                           value: ReaderFontPreset.serif,
-                          label: Text('宋体'),
+                          label: Text(ReaderStrings.serifFont),
                         ),
                       ],
                       selected: <ReaderFontPreset>{_preferences.font},
@@ -1525,14 +1888,16 @@ class _TextReaderViewState extends State<TextReaderView> {
                         _preferences.copyWith(navigationMode: value.first),
                       ),
                     ),
-                    const SizedBox(height: 10),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text(ReaderStrings.keepScreenOn),
-                      value: _preferences.keepScreenOn,
-                      onChanged: (value) =>
-                          update(_preferences.copyWith(keepScreenOn: value)),
-                    ),
+                    if (_keepScreenOnSupported) ...<Widget>[
+                      const SizedBox(height: 10),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text(ReaderStrings.keepScreenOn),
+                        value: _preferences.keepScreenOn,
+                        onChanged: (value) =>
+                            update(_preferences.copyWith(keepScreenOn: value)),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -1585,6 +1950,49 @@ class _CenteredStatus extends StatelessWidget {
   }
 }
 
-extension<T> on List<T> {
+class _ReaderNotice extends StatelessWidget {
+  const _ReaderNotice({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: SafeArea(
+        child: Align(
+          alignment: const Alignment(0, 0.72),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: const Color(0xD92A2926),
+              borderRadius: BorderRadius.circular(24),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+              child: Text(
+                message,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReaderScrollBehavior extends MaterialScrollBehavior {
+  const _ReaderScrollBehavior();
+
+  @override
+  Set<PointerDeviceKind> get dragDevices => const <PointerDeviceKind>{
+    PointerDeviceKind.touch,
+    PointerDeviceKind.mouse,
+    PointerDeviceKind.stylus,
+    PointerDeviceKind.invertedStylus,
+    PointerDeviceKind.trackpad,
+  };
+}
+
+extension<T> on Iterable<T> {
   T? get firstOrNull => isEmpty ? null : first;
 }

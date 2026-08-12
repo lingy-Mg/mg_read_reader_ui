@@ -14,6 +14,13 @@ abstract interface class TextReaderDataSource {
     int pageSize = 100,
   });
 
+  /// Resolves one chapter without scanning catalog pages from the beginning.
+  ///
+  /// [index] is zero-based and must match [ReaderChapterInfo.index] in the
+  /// returned value. This is used for whole-book progress jumps and adjacent
+  /// chapter navigation.
+  Future<ReaderChapterInfo> loadChapterAtIndex(String bookId, int index);
+
   Future<TextChapterContent> loadChapterContent(
     String bookId,
     String chapterId,

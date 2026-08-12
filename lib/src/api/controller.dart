@@ -15,6 +15,7 @@ class TextReaderController extends ChangeNotifier {
   ReaderCommand? _previousPage;
   ReaderCommand? _nextChapter;
   ReaderCommand? _previousChapter;
+  ReaderCommand? _showBookPreview;
   ReaderCommand? _toggleControls;
   ReaderCommand? _showControls;
   ReaderCommand? _hideControls;
@@ -36,6 +37,10 @@ class TextReaderController extends ChangeNotifier {
   Future<void> previousChapter() =>
       _previousChapter?.call() ?? Future<void>.value();
 
+  /// Opens the metadata preview represented by chapter index `-1`.
+  Future<void> showBookPreview() =>
+      _showBookPreview?.call() ?? Future<void>.value();
+
   Future<void> toggleControls() =>
       _toggleControls?.call() ?? Future<void>.value();
 
@@ -53,6 +58,7 @@ class TextReaderController extends ChangeNotifier {
     required ReaderCommand previousPage,
     required ReaderCommand nextChapter,
     required ReaderCommand previousChapter,
+    required ReaderCommand showBookPreview,
     required ReaderCommand toggleControls,
     required ReaderCommand showControls,
     required ReaderCommand hideControls,
@@ -63,6 +69,7 @@ class TextReaderController extends ChangeNotifier {
     _previousPage = previousPage;
     _nextChapter = nextChapter;
     _previousChapter = previousChapter;
+    _showBookPreview = showBookPreview;
     _toggleControls = toggleControls;
     _showControls = showControls;
     _hideControls = hideControls;
@@ -82,6 +89,7 @@ class TextReaderController extends ChangeNotifier {
     _previousPage = null;
     _nextChapter = null;
     _previousChapter = null;
+    _showBookPreview = null;
     _toggleControls = null;
     _showControls = null;
     _hideControls = null;

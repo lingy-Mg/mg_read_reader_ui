@@ -45,6 +45,14 @@ class AppReaderDataSource implements TextReaderDataSource {
   }
 
   @override
+  Future<ReaderChapterInfo> loadChapterAtIndex(
+    String bookId,
+    int index,
+  ) async {
+    return api.fetchChapterInfoAtIndex(bookId, index);
+  }
+
+  @override
   Future<TextChapterContent> loadChapterContent(
     String bookId,
     String chapterId,
@@ -55,6 +63,8 @@ class AppReaderDataSource implements TextReaderDataSource {
 ```
 
 每个 `TextParagraph` 必须有稳定且非空的 ID。阅读位置和书签使用 `chapterId + paragraphId + characterOffset` 保存，因此改变字体或窗口尺寸后仍能恢复到相同语义位置。
+
+阅读器默认进入索引 `-1` 的书籍信息预览，不加载任何章节正文。`loadChapterAtIndex` 用于全书进度条随机定位章节，不会为了跳转顺序遍历所有目录页。
 
 ### 状态接口
 
@@ -83,6 +93,7 @@ await controller.showControls();
 ## 组件内功能
 
 - 默认左右滑页和左/中/右点击区域。
+- 左右翻页同时支持触摸和鼠标按住拖动。
 - 可切换上下连续滚动。
 - 目录分页、当前章高亮和进度跳转。
 - 语义书签的添加、跳转和删除。
@@ -90,6 +101,9 @@ await controller.showControls();
 - 字体、字号、行距、页边距和阅读区域亮度。
 - Android 返回键及 Windows 键盘、鼠标交互。
 - 前后台生命周期通知、进度 flush 和引用计数常亮。
+- 最后一章继续前进时显示“没有下一章了”，不会停在空白边界页。
+
+正文和排版严格按需处理：内存只保留当前章和下一章正文，只有当前章会执行分页；返回上一章时重新加载、临时排版并定位到末页。不支持原生常亮的平台会忽略并隐藏常亮设置。
 
 评论功能首版只保留稳定目标和 capability 扩展点，不显示评论 UI，也不请求评论数据。
 
@@ -114,11 +128,10 @@ flutter run -d windows
 ```bash
 dart format --output=none --set-exit-if-changed .
 flutter analyze
-flutter test
-cd example && flutter test
-cd example && flutter build apk --debug
+cd example
+flutter analyze
 ```
 
-Windows 构建必须在 Windows 主机或 Windows CI 上执行。
+项目不保留或运行自动化测试与 Golden 截图，也不把构建作为 Agent 验证步骤。Android 与 Windows 运行时行为由宿主通过 `example/` 人工检查。
 
 完整工程约定见 [AGENTS.md](AGENTS.md)。

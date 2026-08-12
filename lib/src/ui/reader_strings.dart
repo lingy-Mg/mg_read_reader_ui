@@ -13,6 +13,7 @@ abstract final class ReaderStrings {
   static const addBookmark = '添加书签';
   static const removeBookmark = '删除书签';
   static const noBookmarks = '还没有书签';
+  static const loadMoreChapters = '加载更多章节';
   static const readingMode = '阅读方式';
   static const horizontal = '左右翻页';
   static const vertical = '上下滚动';
@@ -21,8 +22,15 @@ abstract final class ReaderStrings {
   static const pageMargin = '页边距';
   static const brightness = '亮度';
   static const keepScreenOn = '阅读时屏幕常亮';
+  static const bookPreview = '书籍信息';
+  static const startReading = '开始阅读';
+  static const noNextChapter = '没有下一章了';
+  static const noPreviousChapter = '前面是书籍信息页';
   static const day = '日间';
   static const eyeCare = '护眼';
   static const parchment = '羊皮纸';
   static const night = '夜间';
+  static const systemFont = '默认';
+  static const sansSerifFont = '黑体';
+  static const serifFont = '宋体';
 }
