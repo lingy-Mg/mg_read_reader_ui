@@ -1,11 +1,12 @@
 package com.example.novel_reader_ui
 
 import android.app.Activity
-import android.view.WindowManager
 import android.os.Build
+import android.util.Log
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.WindowManager
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -24,6 +25,8 @@ class NovelReaderUiPlugin :
     private var originalStatusBarsVisible: Boolean? = null
     private var originalNavigationBarsVisible: Boolean? = null
     private var originalSystemUiVisibility: Int? = null
+    private var keepScreenOnActivity: Activity? = null
+    private var keepScreenOnAddedByPlugin = false
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(binding.binaryMessenger, "novel_reader_ui/system")
@@ -42,11 +45,13 @@ class NovelReaderUiPlugin :
                     result.error("activity_unavailable", "No Android Activity is attached.", null)
                     return
                 }
-                keepScreenOn = enabled
-                immersiveMode = immersive
-                applyKeepScreenOn(currentActivity, enabled)
-                applyImmersiveMode(currentActivity, immersive)
-                result.success(null)
+                updateReaderSystemUi(
+                    target = currentActivity,
+                    enabled = enabled,
+                    immersive = immersive,
+                    result = result,
+                    commitRequestedState = true,
+                )
             }
             else -> result.notImplemented()
         }
@@ -54,75 +59,139 @@ class NovelReaderUiPlugin :
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activity = binding.activity
-        if (keepScreenOn) applyKeepScreenOn(activity, true)
-        if (immersiveMode) applyImmersiveMode(activity, true)
+        updateReaderSystemUi(activity, keepScreenOn, immersiveMode)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
-        applyKeepScreenOn(activity, false)
-        applyImmersiveMode(activity, false)
+        updateReaderSystemUi(activity, false, false)
         activity = null
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         activity = binding.activity
-        if (keepScreenOn) applyKeepScreenOn(activity, true)
-        if (immersiveMode) applyImmersiveMode(activity, true)
+        updateReaderSystemUi(activity, keepScreenOn, immersiveMode)
     }
 
     override fun onDetachedFromActivity() {
-        applyKeepScreenOn(activity, false)
-        applyImmersiveMode(activity, false)
+        updateReaderSystemUi(activity, false, false)
         activity = null
         keepScreenOn = false
         immersiveMode = false
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        applyKeepScreenOn(activity, false)
-        applyImmersiveMode(activity, false)
+        updateReaderSystemUi(activity, false, false)
+        activity = null
         keepScreenOn = false
         immersiveMode = false
         channel.setMethodCallHandler(null)
     }
 
-    private fun applyKeepScreenOn(target: Activity?, enabled: Boolean) {
-        target ?: return
-        target.runOnUiThread {
-            if (enabled) {
-                target.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    private fun updateReaderSystemUi(
+        target: Activity?,
+        enabled: Boolean,
+        immersive: Boolean,
+        result: MethodChannel.Result? = null,
+        commitRequestedState: Boolean = false,
+    ) {
+        if (target == null) {
+            if (enabled || immersive) {
+                result?.error("activity_unavailable", "No Android Activity is attached.", null)
             } else {
-                target.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                if (commitRequestedState) {
+                    keepScreenOn = false
+                    immersiveMode = false
+                }
+                result?.success(null)
             }
+            return
+        }
+        val previousKeepScreenOn = keepScreenOn
+        val previousImmersiveMode = immersiveMode
+        try {
+            target.runOnUiThread {
+                try {
+                    applyKeepScreenOn(target, enabled)
+                    applyImmersiveMode(target, immersive)
+                    if (commitRequestedState) {
+                        keepScreenOn = enabled
+                        immersiveMode = immersive
+                    }
+                    result?.success(null)
+                } catch (error: Exception) {
+                    if (commitRequestedState) {
+                        try {
+                            applyKeepScreenOn(target, previousKeepScreenOn)
+                            applyImmersiveMode(target, previousImmersiveMode)
+                        } catch (rollbackError: Exception) {
+                            Log.e(TAG, "Failed to restore reader window state", rollbackError)
+                        }
+                    }
+                    reportWindowError(result, error)
+                }
+            }
+        } catch (error: Exception) {
+            reportWindowError(result, error)
         }
     }
 
-    private fun applyImmersiveMode(target: Activity?, enabled: Boolean) {
-        target ?: return
-        target.runOnUiThread {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                target.window.insetsController?.let { controller ->
-                    if (enabled) {
-                        if (originalStatusBarsVisible == null) {
-                            val insets = target.window.decorView.rootWindowInsets
-                            originalStatusBarsVisible = insets?.isVisible(WindowInsets.Type.statusBars()) ?: true
-                            originalNavigationBarsVisible = insets?.isVisible(WindowInsets.Type.navigationBars()) ?: true
-                        }
-                        controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                        controller.hide(WindowInsets.Type.systemBars())
-                    } else {
-                        restoreImmersiveMode(controller)
-                    }
-                }
-            } else {
-                @Suppress("DEPRECATION")
+    private fun applyKeepScreenOn(target: Activity, enabled: Boolean) {
+        if (enabled) {
+            if (keepScreenOnActivity !== target) {
+                keepScreenOnActivity = target
+                keepScreenOnAddedByPlugin = false
+            }
+            val alreadyEnabled =
+                (target.window.attributes.flags and
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0
+            if (!alreadyEnabled) {
+                target.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                keepScreenOnAddedByPlugin = true
+            }
+            return
+        }
+        if (keepScreenOnActivity === target && keepScreenOnAddedByPlugin) {
+            target.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        if (keepScreenOnActivity === target) {
+            keepScreenOnActivity = null
+            keepScreenOnAddedByPlugin = false
+        }
+    }
+
+    private fun applyImmersiveMode(target: Activity, enabled: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            target.window.insetsController?.let { controller ->
                 if (enabled) {
-                    if (originalSystemUiVisibility == null) originalSystemUiVisibility = target.window.decorView.systemUiVisibility
-                    target.window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                } else if (originalSystemUiVisibility != null) {
-                    target.window.decorView.systemUiVisibility = originalSystemUiVisibility!!
-                    originalSystemUiVisibility = null
+                    if (originalStatusBarsVisible == null) {
+                        val insets = target.window.decorView.rootWindowInsets
+                        originalStatusBarsVisible =
+                            insets?.isVisible(WindowInsets.Type.statusBars()) ?: true
+                        originalNavigationBarsVisible =
+                            insets?.isVisible(WindowInsets.Type.navigationBars()) ?: true
+                    }
+                    controller.systemBarsBehavior =
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    controller.hide(WindowInsets.Type.systemBars())
+                } else {
+                    restoreImmersiveMode(controller)
                 }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            if (enabled) {
+                if (originalSystemUiVisibility == null) {
+                    originalSystemUiVisibility = target.window.decorView.systemUiVisibility
+                }
+                target.window.decorView.systemUiVisibility =
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            } else if (originalSystemUiVisibility != null) {
+                target.window.decorView.systemUiVisibility = originalSystemUiVisibility!!
+                originalSystemUiVisibility = null
             }
         }
     }
@@ -140,5 +209,21 @@ class NovelReaderUiPlugin :
         }
         originalStatusBarsVisible = null
         originalNavigationBarsVisible = null
+    }
+
+    private fun reportWindowError(result: MethodChannel.Result?, error: Exception) {
+        if (result != null) {
+            result.error(
+                "system_error",
+                "Unable to update reader system UI.",
+                error.message,
+            )
+        } else {
+            Log.e(TAG, "Unable to update reader system UI", error)
+        }
+    }
+
+    private companion object {
+        const val TAG = "NovelReaderUiPlugin"
     }
 }

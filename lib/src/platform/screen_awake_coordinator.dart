@@ -6,7 +6,9 @@ import 'reader_platform.dart';
 /// Coordinates reader-owned system UI across concurrently mounted readers.
 ///
 /// A holder may request either screen-awake, immersive mode, or both. The
-/// platform receives only aggregate transitions, and calls are serialized.
+/// platform receives only aggregate transitions. A release is issued without
+/// waiting for a slow acquire; if an older call completes late, the newest
+/// aggregate intent is applied again.
 class ScreenAwakeCoordinator {
   ScreenAwakeCoordinator._();
 
@@ -15,6 +17,7 @@ class ScreenAwakeCoordinator {
   final Map<Object, _SystemUiRequest> _holders = <Object, _SystemUiRequest>{};
   Future<void> _operation = Future<void>.value();
   _SystemUiRequest? _scheduled = const _SystemUiRequest();
+  int _transitionGeneration = 0;
 
   int get holderCount => _holders.length;
 
@@ -39,7 +42,8 @@ class ScreenAwakeCoordinator {
     final _SystemUiRequest target = _aggregate();
     if (target == _scheduled) return _operation;
     _scheduled = target;
-    return _enqueue(() async {
+    final int generation = ++_transitionGeneration;
+    final Future<void> transition = () async {
       try {
         await ReaderPlatform.instance.setReaderSystemUi(
           keepScreenOn: target.keepScreenOn,
@@ -47,7 +51,9 @@ class ScreenAwakeCoordinator {
         );
       } catch (error) {
         // A failed transition must not suppress an identical retry.
-        if (_scheduled == target) _scheduled = null;
+        if (generation == _transitionGeneration && _scheduled == target) {
+          _scheduled = null;
+        }
         throw ReaderFailure(
           ReaderFailureKind.platform,
           target.keepScreenOn
@@ -58,22 +64,21 @@ class ScreenAwakeCoordinator {
           cause: error,
         );
       }
-    });
+      if (generation != _transitionGeneration && _aggregate() != target) {
+        // The stale call may have overwritten a newer platform state. Reapply
+        // the aggregate intent without waiting for unrelated slow callbacks.
+        _scheduled = null;
+        _applyIfChanged().ignore();
+      }
+    }();
+    _operation = transition.then<void>((_) {}, onError: (_) {});
+    return transition;
   }
 
   _SystemUiRequest _aggregate() => _SystemUiRequest(
     keepScreenOn: _holders.values.any((v) => v.keepScreenOn),
     immersiveMode: _holders.values.any((v) => v.immersiveMode),
   );
-
-  Future<void> _enqueue(Future<void> Function() action) {
-    final Future<void> next = _operation.then(
-      (_) => action(),
-      onError: (_) => action(),
-    );
-    _operation = next.then<void>((_) {}, onError: (_) {});
-    return next;
-  }
 }
 
 class _SystemUiRequest {

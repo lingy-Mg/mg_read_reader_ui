@@ -1,6 +1,6 @@
 name: novel_reader_ui
-description: An embeddable Flutter text reader with Android and Windows screen-awake support.
-version: 0.2.0
+description: An embeddable Flutter text and vertical comic reader with Android and Windows screen-awake support.
+version: 0.4.0
 publish_to: none
 
 environment:
@@ -18,6 +18,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/backgrounds/
   fonts:
     - family: MiSans
       fonts:
