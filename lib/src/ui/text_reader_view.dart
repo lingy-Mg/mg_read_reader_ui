@@ -22,6 +22,7 @@ import 'fonts/reader_font_controller.dart';
 import 'reader_strings.dart';
 import 'reader_theme.dart';
 import 'settings/reader_settings_sheet.dart';
+import 'settings/reader_settings_tokens.dart';
 
 /// A complete, embeddable text reading surface.
 ///
@@ -3832,7 +3833,10 @@ class _TextReaderViewState extends State<TextReaderView> {
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
+      isDismissible: true,
+      enableDrag: true,
       backgroundColor: Colors.transparent,
+      barrierColor: ReaderSettingsTokens.sheetBarrier(_palette),
       builder: (BuildContext sheetContext) {
         return StatefulBuilder(
           builder: (BuildContext context, StateSetter setSheetState) {
@@ -3858,77 +3862,83 @@ class _TextReaderViewState extends State<TextReaderView> {
               });
             }
             final MediaQueryData mediaQuery = MediaQuery.of(context);
+            final double sheetHeight = (mediaQuery.size.height * 0.74)
+                .clamp(0, 640)
+                .toDouble();
             return MediaQuery(
               data: mediaQuery.copyWith(
                 textScaler: mediaQuery.textScaler.clamp(maxScaleFactor: 1.3),
               ),
-              child: Align(
-                alignment: Alignment.bottomCenter,
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(
-                    maxWidth: 680,
-                    maxHeight: 640,
-                  ),
-                  child: ClipRRect(
-                    borderRadius: const BorderRadius.vertical(
-                      top: Radius.circular(20),
-                    ),
-                    child: Material(
-                      color: _palette.panel,
-                      child: SafeArea(
-                        top: false,
-                        child: DefaultTabController(
-                          length: 3,
-                          initialIndex: initialIndex,
-                          child: SizedBox(
-                            height: MediaQuery.sizeOf(context).height * 0.74,
-                            child: Column(
-                              children: <Widget>[
-                                const SizedBox(height: 8),
-                                Container(
-                                  width: 34,
-                                  height: 4,
-                                  decoration: BoxDecoration(
-                                    color: _palette.divider,
-                                    borderRadius: BorderRadius.circular(2),
+              // Limit the route child to the visible panel so the uncovered
+              // reader area remains the tappable modal barrier.
+              child: SizedBox(
+                width: double.infinity,
+                height: sheetHeight,
+                child: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 680),
+                    child: SizedBox(
+                      height: sheetHeight,
+                      child: ClipRRect(
+                        borderRadius: const BorderRadius.vertical(
+                          top: Radius.circular(20),
+                        ),
+                        child: Material(
+                          color: _palette.panel,
+                          child: SafeArea(
+                            top: false,
+                            child: DefaultTabController(
+                              length: 3,
+                              initialIndex: initialIndex,
+                              child: Column(
+                                children: <Widget>[
+                                  const SizedBox(height: 8),
+                                  Container(
+                                    width: 34,
+                                    height: 4,
+                                    decoration: BoxDecoration(
+                                      color: _palette.divider,
+                                      borderRadius: BorderRadius.circular(2),
+                                    ),
                                   ),
-                                ),
-                                const SizedBox(height: 4),
-                                const TabBar(
-                                  dividerHeight: 1,
-                                  labelStyle: TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  tabs: <Widget>[
-                                    Tab(text: ReaderStrings.bookDetails),
-                                    Tab(text: ReaderStrings.catalog),
-                                    Tab(text: ReaderStrings.bookmarks),
-                                  ],
-                                ),
-                                Expanded(
-                                  child: TabBarView(
-                                    children: <Widget>[
-                                      _buildBookDetailTab(
-                                        routeSession,
-                                        routeBookId,
-                                      ),
-                                      _buildCatalogList(
-                                        sheetContext,
-                                        routeSession,
-                                        routeBookId,
-                                        routeStore,
-                                      ),
-                                      _buildBookmarkList(
-                                        sheetContext,
-                                        routeSession,
-                                        routeBookId,
-                                        routeStore,
-                                      ),
+                                  const SizedBox(height: 4),
+                                  const TabBar(
+                                    dividerHeight: 1,
+                                    labelStyle: TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                    tabs: <Widget>[
+                                      Tab(text: ReaderStrings.bookDetails),
+                                      Tab(text: ReaderStrings.catalog),
+                                      Tab(text: ReaderStrings.bookmarks),
                                     ],
                                   ),
-                                ),
-                              ],
+                                  Expanded(
+                                    child: TabBarView(
+                                      children: <Widget>[
+                                        _buildBookDetailTab(
+                                          routeSession,
+                                          routeBookId,
+                                        ),
+                                        _buildCatalogList(
+                                          sheetContext,
+                                          routeSession,
+                                          routeBookId,
+                                          routeStore,
+                                        ),
+                                        _buildBookmarkList(
+                                          sheetContext,
+                                          routeSession,
+                                          routeBookId,
+                                          routeStore,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),

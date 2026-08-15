@@ -41,6 +41,8 @@ Future<void> showReaderSettingsSheet({
   return showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
+    isDismissible: true,
+    enableDrag: true,
     useSafeArea: false,
     backgroundColor: Colors.transparent,
     barrierColor: ReaderSettingsTokens.sheetBarrier(palette),
@@ -50,36 +52,37 @@ Future<void> showReaderSettingsSheet({
                   ReaderSettingsTokens.sheetHeightFactor)
               .clamp(0, ReaderSettingsTokens.maxDesktopSheetHeight)
               .toDouble();
-      return Align(
-        alignment: Alignment.bottomCenter,
-        child: SizedBox(
-          height: height,
-          child: ReaderSettingsSheet(
-            preferences: preferences,
-            palette: palette,
-            platformCapabilities: platformCapabilities,
-            commentsAvailable: commentsAvailable,
-            autoReading: autoReading,
-            autoReadingPace: autoReadingPace,
-            lastNonNightTheme: lastNonNightTheme,
-            fontRepository: fontRepository,
-            onCustomFontSelected: onCustomFontSelected,
-            onFontError: onFontError,
-            onPreferencesPreview: (TextReaderPreferences value) {
-              latestPreferences = value.normalized();
-              hasPendingPreview = true;
-              onPreferencesPreview(latestPreferences);
-            },
-            onPreferencesCommit: (TextReaderPreferences value) {
-              latestPreferences = value.normalized();
-              hasPendingPreview = false;
-              onPreferencesCommit(latestPreferences);
-            },
-            onAutoReadingChanged: onAutoReadingChanged,
-            onAutoReadingPaceChanged: onAutoReadingPaceChanged,
-            onCatalogPressed: onCatalogPressed,
-            onBookmarksPressed: onBookmarksPressed,
-          ),
+      // Keep the route child limited to the visible sheet. A full-height Align
+      // would cover the modal barrier with a transparent BottomSheet surface,
+      // preventing outside taps from dismissing the sheet.
+      return SizedBox(
+        width: double.infinity,
+        height: height,
+        child: ReaderSettingsSheet(
+          preferences: preferences,
+          palette: palette,
+          platformCapabilities: platformCapabilities,
+          commentsAvailable: commentsAvailable,
+          autoReading: autoReading,
+          autoReadingPace: autoReadingPace,
+          lastNonNightTheme: lastNonNightTheme,
+          fontRepository: fontRepository,
+          onCustomFontSelected: onCustomFontSelected,
+          onFontError: onFontError,
+          onPreferencesPreview: (TextReaderPreferences value) {
+            latestPreferences = value.normalized();
+            hasPendingPreview = true;
+            onPreferencesPreview(latestPreferences);
+          },
+          onPreferencesCommit: (TextReaderPreferences value) {
+            latestPreferences = value.normalized();
+            hasPendingPreview = false;
+            onPreferencesCommit(latestPreferences);
+          },
+          onAutoReadingChanged: onAutoReadingChanged,
+          onAutoReadingPaceChanged: onAutoReadingPaceChanged,
+          onCatalogPressed: onCatalogPressed,
+          onBookmarksPressed: onBookmarksPressed,
         ),
       );
     },
